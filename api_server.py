@@ -4,7 +4,8 @@
 Architecture:
   - Comet browser running Perplexity Computer on localhost (CDP port 9222)
   - The Dude sends prompts to Computer, polls for responses, streams via SSE
-  - ElevenLabs TTS for audio
+  - TTS via edge-tts (free) or macOS say (built-in) — no API keys needed
+  - STT via browser-native Web Speech API (client-side, no server needed)
   - No API keys needed for LLM — Computer IS the brain
 """
 
@@ -13,10 +14,11 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from typing import List, Optional
 
-from fastapi import FastAPI, File, UploadFile, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -24,32 +26,40 @@ from pydantic import BaseModel, Field
 
 from comet_bridge import CometBridge
 
-# Audio modules depend on internal pplx SDK — gracefully degrade if unavailable
+# TTS engine — graceful degradation if no engine available
 try:
-    from generate_audio import generate_audio
-    HAS_TTS = True
+    from tts_engine import generate_tts, HAS_TTS, get_audio_content_type
 except ImportError:
     HAS_TTS = False
-    logging.getLogger("the-dude").warning("TTS unavailable (pplx SDK not installed)")
+    logging.getLogger("the-dude").warning("TTS module not found")
 
-try:
-    from transcribe_audio import transcribe_audio
-    HAS_STT = True
-except ImportError:
-    HAS_STT = False
-    logging.getLogger("the-dude").warning("STT unavailable (pplx SDK not installed)")
-
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger("the-dude")
 
 # ── CONFIGURATION ──
 COMET_CDP_PORT = int(os.environ.get("COMET_CDP_PORT", "9222"))
-DUDE_PERSONA = os.environ.get("DUDE_PERSONA", "")
 DUDE_MODE = os.environ.get("DUDE_MODE", "chat")
+
+# The Dude's persona — prepended to every prompt so Computer responds in character
+DUDE_PERSONA = os.environ.get("DUDE_PERSONA", (
+    "You are The Dude (from The Big Lebowski). Respond in character: "
+    "laid-back, uses 'man' and 'dude' naturally, references bowling/White Russians "
+    "occasionally, rambles a bit but gets to the point. Keep answers helpful and "
+    "accurate — you have Computer's knowledge but deliver it in The Dude's voice. "
+    "Keep responses concise (2-4 sentences for simple questions, more for complex ones). "
+    "Don't break character or mention being an AI."
+))
 
 bridge = CometBridge(port=COMET_CDP_PORT)
 
 MAX_MESSAGE_LEN = 2000
+
+# Concurrency lock — only one prompt at a time to Perplexity
+_prompt_lock = asyncio.Lock()
 
 # Status messages shown while Computer is working
 WORKING_MESSAGES = [
@@ -63,14 +73,59 @@ WORKING_MESSAGES = [
 
 
 def sse(data: dict) -> str:
+    """Format a dict as an SSE data line."""
     return f"data: {json.dumps(data)}\n\n"
 
 
 def _build_prompt(user_message: str) -> str:
-    """Optionally prefix the user message with the Dude persona instruction."""
+    """Prefix the user message with The Dude persona instruction."""
     if DUDE_PERSONA:
         return f"{DUDE_PERSONA}\n\n{user_message}"
     return user_message
+
+
+def _clean_response(text: str) -> str:
+    """Clean Computer's response — strip source citations, tool-use noise, etc.
+
+    Perplexity responses often include:
+    - Source reference numbers like [1], [2], etc.
+    - "No tools were needed..." boilerplate
+    - Source attribution lines (zeitverschiebung, reddit, etc.)
+    - "Reviewed X sources" / "X steps completed" artifacts
+    - Markdown formatting that's fine to keep
+    """
+    if not text:
+        return text
+
+    # Remove source reference numbers [1], [2], etc.
+    text = re.sub(r'\[\d+\]', '', text)
+
+    # Remove "No tools were needed..." type boilerplate
+    text = re.sub(r'No tools were needed[^.]*\.?\s*', '', text, flags=re.IGNORECASE)
+
+    # Remove "Reviewed N sources" / "N steps completed" artifacts
+    text = re.sub(r'Reviewed \d+ sources?\.?\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\d+ steps? completed\.?\s*', '', text, flags=re.IGNORECASE)
+
+    # Remove standalone source names that appear at start of text
+    # (e.g., "reddit vocabulary +1" that leak from Perplexity UI)
+    text = re.sub(r'^(reddit|vocabulary|wikipedia|\+\d+)\s*', '', text,
+                  flags=re.IGNORECASE | re.MULTILINE)
+
+    # Remove "View All" / "Show more" UI artifacts
+    text = re.sub(r'(View All|Show more|Ask a follow-up)\s*', '', text, flags=re.IGNORECASE)
+
+    # Remove trailing source URLs that sometimes leak
+    text = re.sub(r'\n\s*Sources?:?\s*\n.*$', '', text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Remove null bytes (seen in logs)
+    text = text.replace('\x00', '')
+
+    # Collapse excessive whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = re.sub(r' {2,}', ' ', text)
+
+    return text.strip()
 
 
 async def stream_response(user_message: str, prefix_events: Optional[List[str]] = None):
@@ -89,156 +144,149 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
     last_status_time = time.time()
     last_step = ""
 
-    async def on_status(status: dict):
-        nonlocal status_idx, last_status_time, last_step
-        now = time.time()
-        step = status.get("currentStep", "")
-        state = status.get("status", "idle")
-
-        if state == "working":
-            if step and step != last_step:
-                last_step = step
-                # Don't yield from callback — we handle it in the polling loop
-
     # Send initial thinking status
     yield sse({"type": "status", "message": "Computer's on it, man..."})
 
-    try:
-        # Ensure connected and on home page before sending
-        try:
-            await bridge.ensure_connected()
-            await bridge._ensure_home_page()
-        except ConnectionError as e:
-            yield sse({"type": "text", "chunk": str(e)})
-            yield sse({"type": "done"})
-            return
+    # Only one prompt at a time — wait for the lock
+    if _prompt_lock.locked():
+        yield sse({"type": "status", "message": "Hold on, man, still working on the last thing..."})
 
-        # Type and submit the prompt
-        try:
-            from comet_bridge import JS_CHECK_INPUT, JS_FOCUS_INPUT
-            from comet_bridge import JS_CHECK_SUBMITTED, JS_CLICK_SUBMIT
-            from comet_bridge import JS_GET_STATUS, JS_EXTRACT_RESPONSE
+    full_text = ""
 
-            result = await bridge._clear_and_type(prompt)
-            if not result or not result.get("success"):
-                yield sse({"type": "text", "chunk": "Couldn't type into Perplexity, man. Is the page loaded?"})
+    async with _prompt_lock:
+        try:
+            # Ensure connected and on clean page before sending
+            try:
+                await bridge.ensure_connected()
+                await bridge._ensure_home_page()
+            except ConnectionError as e:
+                log.error(f"Connection error: {e}")
+                yield sse({"type": "text", "chunk": str(e)})
                 yield sse({"type": "done"})
                 return
 
-            has_content = await bridge._evaluate(JS_CHECK_INPUT)
-            if not has_content:
-                yield sse({"type": "text", "chunk": "Typing failed, man. Try again."})
-                yield sse({"type": "done"})
-                return
+            # Type and submit the prompt
+            try:
+                from comet_bridge import (
+                    JS_CHECK_INPUT, JS_FOCUS_INPUT,
+                    JS_CHECK_SUBMITTED, JS_CLICK_SUBMIT,
+                    JS_GET_STATUS, JS_EXTRACT_RESPONSE,
+                )
 
-            await bridge._evaluate(JS_FOCUS_INPUT)
-            await bridge._press_key("Enter", "Enter", 13)
-            await asyncio.sleep(0.5)
+                result = await bridge._clear_and_type(prompt)
+                if not result or not result.get("success"):
+                    yield sse({"type": "text", "chunk": "Couldn't type into Perplexity, man. Is the page loaded?"})
+                    yield sse({"type": "done"})
+                    return
 
-            submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
-            if not submitted:
-                await bridge._evaluate(JS_CLICK_SUBMIT)
+                has_content = await bridge._evaluate(JS_CHECK_INPUT)
+                if not has_content:
+                    yield sse({"type": "text", "chunk": "Typing failed, man. Try again."})
+                    yield sse({"type": "done"})
+                    return
+
+                await bridge._evaluate(JS_FOCUS_INPUT)
+                await bridge._press_key("Enter", "Enter", 13)
                 await asyncio.sleep(0.5)
+
                 submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
                 if not submitted:
-                    await bridge._press_key("Enter", "Enter", 13)
+                    await bridge._evaluate(JS_CLICK_SUBMIT)
+                    await asyncio.sleep(0.5)
+                    submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
+                    if not submitted:
+                        await bridge._press_key("Enter", "Enter", 13)
+
+            except Exception as e:
+                log.error(f"Submit error: {e}")
+                yield sse({"type": "text", "chunk": "The Dude got disconnected from Computer, man."})
+                yield sse({"type": "done"})
+                return
+
+            # Wait for Perplexity to start processing (URL changes to /search/)
+            submit_wait = 0
+            while submit_wait < 30:
+                await asyncio.sleep(1)
+                submit_wait += 1
+                try:
+                    await bridge._send_cdp("Runtime.enable")
+                    current_url = await bridge._evaluate("window.location.href")
+                    log.info(f"Post-submit URL [{submit_wait}s]: {current_url}")
+                    if current_url and ("/search/" in current_url or "/thread/" in current_url):
+                        log.info("Submission confirmed — on response page")
+                        await asyncio.sleep(1)
+                        break
+                except Exception as e:
+                    log.warning(f"Post-submit check error: {e}")
+                    continue
+
+            # Poll for response, yielding status updates via SSE
+            elapsed = 0.0
+            poll_interval = 2.0
+            timeout = 300.0
+            idle_count = 0
+            ever_saw_working = False
+
+            while elapsed < timeout:
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+
+                try:
+                    status = await bridge._evaluate(JS_GET_STATUS)
+                except Exception as e:
+                    log.warning(f"Status poll error: {e}")
+                    continue
+
+                state = status.get("status", "idle") if isinstance(status, dict) else "idle"
+                step = status.get("currentStep", "") if isinstance(status, dict) else ""
+                log.info(f"Poll [{elapsed:.0f}s]: state={state} step={step[:60]}")
+
+                # Send periodic status updates
+                if state == "working":
+                    idle_count = 0
+                    ever_saw_working = True
+                    if step and step != last_step:
+                        last_step = step
+                        yield sse({"type": "status", "message": f"{step}..."})
+                    elif time.time() - last_status_time > 4:
+                        msg = WORKING_MESSAGES[status_idx % len(WORKING_MESSAGES)]
+                        status_idx += 1
+                        last_status_time = time.time()
+                        yield sse({"type": "status", "message": msg})
+
+                elif state == "completed":
+                    response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
+                    if response and len(str(response).strip()) > 0:
+                        full_text = str(response).strip()
+                    else:
+                        await asyncio.sleep(1)
+                        response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
+                        full_text = str(response).strip() if response else ""
+                    if not full_text:
+                        full_text = "(Computer finished but returned no text, man.)"
+                    break
+
+                elif state == "idle":
+                    idle_count += 1
+                    idle_patience = 10 if ever_saw_working else 30
+                    if idle_count > 5:
+                        response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
+                        if response and len(str(response).strip()) > 0:
+                            full_text = str(response).strip()
+                            break
+                        if idle_count > idle_patience:
+                            full_text = "(Computer didn't respond. Try again, man.)"
+                            break
+
+            if not full_text:
+                full_text = "(Timed out waiting for Computer, man. That's a bummer.)"
 
         except Exception as e:
-            log.error(f"Submit error: {e}")
-            yield sse({"type": "text", "chunk": "The Dude got disconnected from Computer, man."})
-            yield sse({"type": "done"})
-            return
+            log.error(f"Bridge error: {e}", exc_info=True)
+            full_text = "The Dude got disconnected from Computer, man."
 
-        # Wait for Perplexity to start processing (URL changes to /search/)
-        # After submission, the SPA may navigate to a new URL. We need to
-        # wait for this and re-enable Runtime for the new page context.
-        submit_wait = 0
-        while submit_wait < 30:  # up to 30 seconds
-            await asyncio.sleep(1)
-            submit_wait += 1
-            try:
-                await bridge._send_cdp("Runtime.enable")
-                current_url = await bridge._evaluate("window.location.href")
-                log.info(f"Post-submit URL [{submit_wait}s]: {current_url}")
-                if current_url and ("/search/" in current_url or "/thread/" in current_url):
-                    # Perplexity accepted the query and navigated to response page
-                    log.info("Submission confirmed — on response page")
-                    await asyncio.sleep(1)  # brief settle time
-                    break
-            except Exception as e:
-                log.warning(f"Post-submit check error: {e}")
-                # Connection might be resetting during navigation, keep trying
-                continue
-
-        # Poll for response, yielding status updates via SSE
-        elapsed = 0.0
-        poll_interval = 2.0
-        timeout = 300.0
-        idle_count = 0
-        ever_saw_working = False
-        full_text = ""
-
-        while elapsed < timeout:
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-
-            try:
-                status = await bridge._evaluate(JS_GET_STATUS)
-            except Exception as e:
-                log.warning(f"Status poll error: {e}")
-                continue
-
-            state = status.get("status", "idle")
-            step = status.get("currentStep", "")
-            log.info(f"Poll [{elapsed:.0f}s]: state={state} step={step}")
-
-            # Send periodic status updates
-            if state == "working":
-                idle_count = 0
-                ever_saw_working = True
-                if step and step != last_step:
-                    last_step = step
-                    yield sse({"type": "status", "message": f"{step}..."})
-                elif time.time() - last_status_time > 4:
-                    msg = WORKING_MESSAGES[status_idx % len(WORKING_MESSAGES)]
-                    status_idx += 1
-                    last_status_time = time.time()
-                    yield sse({"type": "status", "message": msg})
-
-            elif state == "completed":
-                response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
-                if response and len(response.strip()) > 0:
-                    full_text = response.strip()
-                else:
-                    await asyncio.sleep(1)
-                    response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
-                    full_text = response.strip() if response else ""
-                if not full_text:
-                    full_text = "(Computer finished but returned no text, man.)"
-                break
-
-            elif state == "idle":
-                idle_count += 1
-                # After submission, Perplexity takes several seconds to start
-                # showing working indicators (especially after page navigation).
-                # Be patient: wait up to 60s (30 polls) before giving up.
-                # If we already saw "working", use a shorter threshold.
-                idle_patience = 10 if ever_saw_working else 30
-                if idle_count > 5:
-                    response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
-                    if response and len(response.strip()) > 0:
-                        full_text = response.strip()
-                        break
-                    if idle_count > idle_patience:
-                        full_text = "(Computer didn't respond. Try again, man.)"
-                        break
-
-        if not full_text:
-            full_text = "(Timed out waiting for Computer, man. That's a bummer.)"
-
-    except Exception as e:
-        log.error(f"Bridge error: {e}")
-        full_text = "The Dude got disconnected from Computer, man."
+    # Clean the response
+    full_text = _clean_response(full_text)
 
     # Stream the response text to frontend in chunks
     yield sse({"type": "status", "message": ""})
@@ -254,17 +302,18 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
     llm_ms = int((time.time() - t0) * 1000)
     log.info(f"Computer ({llm_ms}ms): {full_text[:80]}")
 
-    # Generate TTS (if pplx SDK available)
+    # Generate TTS if available
     if HAS_TTS:
         try:
             audio_bytes = await asyncio.wait_for(
-                generate_audio(full_text.strip(), voice="clyde", model="elevenlabs_tts_v3"),
-                timeout=15,
+                generate_tts(full_text),
+                timeout=30,
             )
             b64 = base64.b64encode(audio_bytes).decode()
-            yield sse({"type": "audio", "data": b64})
+            content_type = get_audio_content_type()
+            yield sse({"type": "audio", "data": b64, "format": content_type})
             tts_ms = int((time.time() - t0) * 1000) - llm_ms
-            log.info(f"TTS ({tts_ms}ms)")
+            log.info(f"TTS ({tts_ms}ms, {len(audio_bytes)} bytes)")
         except asyncio.TimeoutError:
             log.error("TTS timeout")
         except Exception as e:
@@ -276,8 +325,13 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
 
 
 # ── FastAPI ──
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="The Dude", version="2.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class ChatRequest(BaseModel):
@@ -293,39 +347,13 @@ async def chat(req: ChatRequest, request: Request):
     )
 
 
-@app.post("/api/voice")
-async def voice(request: Request, audio: UploadFile = File(...)):
-    audio_bytes = await audio.read()
-    if len(audio_bytes) > 10 * 1024 * 1024:
-        return JSONResponse({"error": "Audio too large, man"}, status_code=413)
-    content_type = audio.content_type or "audio/webm"
-    log.info(f"Voice: {len(audio_bytes)} bytes")
-
-    if not HAS_STT:
-        return JSONResponse({"error": "Voice not available — pplx SDK not installed"}, status_code=501)
-
-    try:
-        result = await transcribe_audio(audio_bytes, media_type=content_type)
-        user_text = result["text"].strip()
-        log.info(f"STT: {user_text[:80]}")
-    except Exception as e:
-        log.error(f"STT failed: {e}")
-        return JSONResponse({"error": "Could not understand audio"}, status_code=400)
-
-    if not user_text:
-        return JSONResponse({"error": "No speech detected"}, status_code=400)
-
-    prefix = [sse({"type": "transcription", "text": user_text})]
-    return StreamingResponse(
-        stream_response(user_text, prefix_events=prefix),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
-
-
 @app.get("/api/health")
 async def health():
-    return {"status": "The Dude abides", "mode": DUDE_MODE}
+    return {
+        "status": "The Dude abides",
+        "mode": DUDE_MODE,
+        "tts": HAS_TTS,
+    }
 
 
 @app.get("/api/status")
@@ -335,7 +363,6 @@ async def status():
         connected = await bridge.is_connected()
         if connected:
             return {"status": "connected", "message": "Computer is online, man."}
-        # Try to connect
         tab_url = await bridge.connect()
         return {"status": "connected", "message": f"Connected to {tab_url}"}
     except ConnectionError as e:
@@ -351,8 +378,11 @@ async def status():
 
 
 # Serve static files (index.html, images, etc.) from the same directory
-app.mount("/", StaticFiles(directory=os.path.dirname(os.path.abspath(__file__)), html=True), name="static")
-
+app.mount(
+    "/",
+    StaticFiles(directory=os.path.dirname(os.path.abspath(__file__)), html=True),
+    name="static",
+)
 
 if __name__ == "__main__":
     import uvicorn

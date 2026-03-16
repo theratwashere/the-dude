@@ -557,49 +557,9 @@ async function sendMessage(message) {
   }
 }
 
-async function sendVoiceBlob(blob) {
-  if (isBusy) {
-    interruptDude();
-    await new Promise(r => setTimeout(r, 50));
-  }
-
-  setBusy(true);
-  clearDudeText();
-  setStatus('thinking');
-  ensureAudioCtx();
-
-  abortController = new AbortController();
-  audioQueue = [];
-
-  try {
-    const form = new FormData();
-    form.append('audio', blob, 'recording.webm');
-    const res = await fetch(`${API}/api/voice`, {
-      method: 'POST',
-      headers: { ...COMMON_HEADERS },
-      body: form,
-      signal: abortController.signal,
-    });
-
-    const ct = res.headers.get('content-type') || '';
-    if (ct.includes('application/json')) {
-      const data = await res.json();
-      setStatus(data.error || 'Something went wrong');
-      setTimeout(() => setStatus(''), 3000);
-      setBusy(false);
-      return;
-    }
-
-    await processSSEStream(res);
-  } catch (err) {
-    if (err.name !== 'AbortError') {
-      console.error('Voice error:', err);
-      setStatus('Connection lost, man...');
-      setTimeout(() => setStatus(''), 3000);
-      setBusy(false);
-    }
-  }
-}
+// Voice input is handled client-side via Web Speech API (see startRecording).
+// No server-side STT endpoint needed — the recognized text is sent as a
+// regular chat message via sendMessage().
 
 async function processSSEStream(response) {
   const reader = response.body.getReader();
@@ -634,8 +594,8 @@ async function processSSEStream(response) {
             break;
 
           case 'audio':
-            console.log('Audio event received:', event.data.length, 'chars');
-            audioQueue.push(event.data);
+            console.log('Audio event received:', event.data.length, 'chars, format:', event.format || 'audio/mp3');
+            audioQueue.push({ data: event.data, format: event.format || 'audio/mp3' });
             if (!playingAudio) drainAudioQueue();
             break;
 
@@ -675,9 +635,9 @@ async function drainAudioQueue() {
   ensureAudioCtx();
 
   while (audioQueue.length > 0) {
-    const b64 = audioQueue.shift();
+    const item = audioQueue.shift();
     try {
-      await playAudioChunk(b64);
+      await playAudioChunk(item.data, item.format);
     } catch (err) {
       console.error('Playback error:', err);
     }
@@ -690,13 +650,14 @@ async function drainAudioQueue() {
   setBusy(false);
 }
 
-function playAudioChunk(b64mp3) {
+function playAudioChunk(b64data, format) {
+  const mimeType = format || 'audio/mp3';
   return new Promise((resolve, reject) => {
     try {
-      const binary = atob(b64mp3);
+      const binary = atob(b64data);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const blob = new Blob([bytes], { type: 'audio/mp3' });
+      const blob = new Blob([bytes], { type: mimeType });
       const url = URL.createObjectURL(blob);
 
       const audio = new Audio();

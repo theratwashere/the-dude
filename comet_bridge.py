@@ -1,8 +1,9 @@
 """Comet Bridge — CDP interface to Perplexity Computer via Comet browser.
 
 Connects to the locally-running Comet browser via Chrome DevTools Protocol,
-finds the Perplexity tab, sends prompts, and extracts responses. Zero API keys
-needed — The Dude is just a voice/visual frontend for Computer.
+finds the Perplexity tab (preferring the sidecar panel), sends prompts, and
+extracts responses. Zero API keys needed — The Dude is just a voice/visual
+frontend for Computer.
 """
 
 import asyncio
@@ -24,14 +25,16 @@ INPUT_SELECTORS = [
     'input[type="text"]',
 ]
 
-# JavaScript: focus and clear the Perplexity input (works with Lexical editor)
+# ── JavaScript Fragments ──
+# These are evaluated in the Perplexity tab via CDP Runtime.evaluate
+
+# Focus and clear the Perplexity input (works with Lexical editor)
 JS_FOCUS_AND_CLEAR = """
 (() => {
     const el = document.querySelector('[contenteditable="true"]');
     if (el) {
         el.focus();
         el.click();
-        // Select all content for deletion
         const range = document.createRange();
         range.selectNodeContents(el);
         const sel = window.getSelection();
@@ -49,13 +52,12 @@ JS_FOCUS_AND_CLEAR = """
 })()
 """
 
-# JavaScript: check if text was typed into the input (ignore placeholder)
+# Check if text was typed into the input (ignore placeholder)
 JS_CHECK_INPUT = """
 (() => {
     const el = document.querySelector('[contenteditable="true"]');
     if (el) {
         const text = el.innerText.trim();
-        // Lexical empty state is just a newline; placeholder is in aria-placeholder
         return text.length > 0 && text !== String.fromCharCode(10);
     }
     const textarea = document.querySelector('textarea');
@@ -64,7 +66,7 @@ JS_CHECK_INPUT = """
 })()
 """
 
-# JavaScript: focus input element before pressing Enter
+# Focus input element before pressing Enter
 JS_FOCUS_INPUT = """
 (() => {
     const el = document.querySelector('[contenteditable="true"]') ||
@@ -73,7 +75,7 @@ JS_FOCUS_INPUT = """
 })()
 """
 
-# JavaScript: check submission status (input cleared or loading started)
+# Check submission status (input cleared or loading started)
 JS_CHECK_SUBMITTED = """
 (() => {
     const el = document.querySelector('[contenteditable="true"]');
@@ -83,7 +85,7 @@ JS_CHECK_SUBMITTED = """
 })()
 """
 
-# JavaScript: click submit button as fallback
+# Click submit button as fallback
 JS_CLICK_SUBMIT = """
 (() => {
     const selectors = [
@@ -130,11 +132,10 @@ JS_CLICK_SUBMIT = """
 })()
 """
 
-# JavaScript: poll agent status — is Computer still working?
-# NOTE: Perplexity can have persistent animate-spin elements (sidebar/UI chrome)
-# that are NOT related to response generation. We must not treat those as "working".
-# The stop button is the most reliable "working" signal. Spinners are only trusted
-# when they appear inside the main content area, near the response.
+# Poll agent status — is Computer still working?
+# Perplexity can have persistent animate-spin elements (sidebar/UI chrome)
+# that are NOT related to response generation. The stop button is the most
+# reliable "working" signal.
 JS_GET_STATUS = """
 (() => {
     const body = document.body.innerText;
@@ -144,7 +145,6 @@ JS_GET_STATUS = """
     for (const btn of document.querySelectorAll('button')) {
         const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
         const text = (btn.innerText || '').toLowerCase().trim();
-        // Stop buttons typically have aria-label with "stop" or contain a rect SVG icon
         if ((ariaLabel.includes('stop') || ariaLabel.includes('cancel') ||
              text === 'stop' || text === 'cancel') &&
             btn.offsetParent !== null && !btn.disabled) {
@@ -154,14 +154,11 @@ JS_GET_STATUS = """
     }
 
     // Check for loading spinners ONLY within the main content area
-    // (ignore persistent sidebar/nav spinners)
     const mainArea = document.querySelector('main') || document.body;
     const mainSpinners = mainArea.querySelectorAll('[class*="animate-spin"]');
     let hasActiveSpinner = false;
     for (const el of mainSpinners) {
-        // Only count spinners that are NOT in nav/sidebar/header
         if (!el.closest('nav, aside, header, footer') && el.offsetParent !== null) {
-            // Additional check: ignore tiny decorative spinners
             const rect = el.getBoundingClientRect();
             if (rect.width > 4 && rect.height > 4) {
                 hasActiveSpinner = true;
@@ -179,29 +176,24 @@ JS_GET_STATUS = """
     const hasFinishedMarker = body.includes('Finished') && !hasActiveStopButton;
     const hasSourceCount = /\\d+ sources?/.test(body);
 
-    // Check for active generation indicators in the text
-    // Be specific to avoid false positives from response content
-    // (e.g. 'Reading' matches 'Read my replies out loud')
     const workingPatterns = [
         'Preparing to assist', 'Reviewing sources', 'Searching the web',
         'Clicking', 'Typing:', 'Navigating to', 'Analyzing'
     ];
     const hasWorkingText = workingPatterns.some(p => body.includes(p));
 
-    // Determine status with priority ordering:
+    // Priority ordering:
     // 1. Stop button = definitely working
-    // 2. "Ask a follow-up" + prose content = definitely completed
-    //    (this overrides spinners, which can be persistent UI elements)
+    // 2. "Ask a follow-up" + prose content = completed (overrides spinners)
     // 3. Reviewed/Finished markers = completed
     // 4. Active working text = working
-    // 5. Active content-area spinner (without completion markers) = working
-    // 6. Otherwise idle
+    // 5. Active content-area spinner = working
+    // 6. Has prose content without working signals = completed
+    // 7. Otherwise idle
     let status = 'idle';
     if (hasActiveStopButton) {
         status = 'working';
     } else if (hasAskFollowUp) {
-        // "Ask a follow-up" is the strongest completion signal — it only
-        // appears after Perplexity has finished generating the response.
         status = 'completed';
     } else if (hasStepsCompleted || hasFinishedMarker) {
         status = 'completed';
@@ -214,8 +206,6 @@ JS_GET_STATUS = """
     } else if (hasActiveSpinner) {
         status = 'working';
     } else if (hasProseContent) {
-        // Has content but no follow-up prompt yet — might still be generating
-        // or might be a quick response. Mark as completed if no other working signals.
         status = 'completed';
     }
 
@@ -235,8 +225,8 @@ JS_GET_STATUS = """
 })()
 """
 
-# JavaScript: extract the response text from prose elements
-# Takes the LAST valid prose element (most recent response in a thread)
+# Extract the response text from prose elements.
+# Takes the LAST valid prose element (most recent response in a thread).
 JS_EXTRACT_RESPONSE = """
 (() => {
     const mainContent = document.querySelector('main') || document.body;
@@ -246,41 +236,43 @@ JS_EXTRACT_RESPONSE = """
     for (const el of allProseEls) {
         if (el.closest('nav, aside, header, footer, form')) continue;
         const text = el.innerText.trim();
-        // Skip UI chrome text
         const isUIText = ['Library', 'Discover', 'Spaces', 'Finance', 'Account',
                           'Upgrade', 'Home', 'Search', 'Ask a follow-up',
                           'Sign in', 'Sign up', 'Continue with', 'Model'].some(
             ui => text.startsWith(ui)
         );
         if (isUIText) continue;
-        // Skip empty text
         if (text.length === 0) continue;
-        // Skip nested prose elements (child already captured)
         const parent = el.parentElement;
         if (parent && parent.matches && parent.matches('[class*="prose"]')) continue;
         validProseTexts.push(text);
     }
 
-    // Take the last (most recent) response
     let response = '';
     if (validProseTexts.length > 0) {
         response = validProseTexts[validProseTexts.length - 1];
     }
 
     if (response) {
-        // Clean up UI artifacts that get included in innerText
         response = response.replace(
             /View All|Show more|Ask a follow-up/gi, ''
         ).trim();
-        // Remove source reference artifacts like "reddit" "vocabulary" "+1"
-        response = response.replace(/^(reddit|vocabulary|wikipedia|\+\d+)\s*/gim, '').trim();
-        // Collapse whitespace
+        response = response.replace(/^(reddit|vocabulary|wikipedia|\\+\\d+)\\s*/gim, '').trim();
         response = response.replace(/\\n{3,}/g, '\\n\\n').trim();
     }
 
     return response.substring(0, 8000);
 })()
 """
+
+# Maximum WebSocket message size (16MB)
+WS_MAX_SIZE = 16 * 1024 * 1024
+
+# CDP response timeout
+CDP_TIMEOUT = 30
+
+# Maximum reconnection attempts
+MAX_RECONNECT_ATTEMPTS = 3
 
 
 class CometBridge:
@@ -290,6 +282,8 @@ class CometBridge:
         self.port = port
         self.ws = None
         self._msg_id = 0
+        self._target_url = None  # Track which tab we're connected to
+        self._is_sidecar = False  # Track if connected to sidecar tab
 
     def _next_id(self) -> int:
         self._msg_id += 1
@@ -303,23 +297,56 @@ class CometBridge:
                 return await resp.json()
 
     async def _send_cdp(self, method: str, params: Optional[dict] = None) -> dict:
-        """Send a CDP JSON-RPC message and wait for its response."""
-        if not self.ws:
-            raise ConnectionError("Not connected to Comet. Call connect() first.")
-        msg_id = self._next_id()
-        msg = {"id": msg_id, "method": method}
-        if params:
-            msg["params"] = params
-        await self.ws.send(json.dumps(msg))
+        """Send a CDP JSON-RPC message and wait for its response.
 
-        # Wait for matching response (skip events)
-        while True:
-            raw = await asyncio.wait_for(self.ws.recv(), timeout=30)
-            data = json.loads(raw)
-            if data.get("id") == msg_id:
-                if "error" in data:
-                    raise RuntimeError(f"CDP error: {data['error']}")
-                return data.get("result", {})
+        Handles WebSocket disconnection by attempting one reconnection.
+        """
+        for attempt in range(2):  # Try once, reconnect + retry if disconnected
+            if not self.ws:
+                if attempt == 0:
+                    raise ConnectionError("Not connected to Comet. Call connect() first.")
+                else:
+                    break
+
+            msg_id = self._next_id()
+            msg = {"id": msg_id, "method": method}
+            if params:
+                msg["params"] = params
+
+            try:
+                await self.ws.send(json.dumps(msg))
+
+                # Wait for matching response (skip events)
+                while True:
+                    raw = await asyncio.wait_for(self.ws.recv(), timeout=CDP_TIMEOUT)
+                    data = json.loads(raw)
+                    if data.get("id") == msg_id:
+                        if "error" in data:
+                            raise RuntimeError(f"CDP error: {data['error']}")
+                        return data.get("result", {})
+
+            except (websockets.exceptions.ConnectionClosed,
+                    websockets.exceptions.ConnectionClosedError,
+                    websockets.exceptions.ConnectionClosedOK,
+                    ConnectionResetError,
+                    BrokenPipeError) as e:
+                log.warning(f"CDP WebSocket disconnected: {e}")
+                self.ws = None
+                if attempt == 0:
+                    log.info("Attempting reconnection...")
+                    try:
+                        await self.connect()
+                        continue  # Retry the CDP command
+                    except Exception as re_err:
+                        log.error(f"Reconnection failed: {re_err}")
+                        raise ConnectionError(f"Lost connection to Comet: {e}") from e
+                raise ConnectionError(f"Lost connection to Comet: {e}") from e
+
+            except asyncio.TimeoutError:
+                log.error(f"CDP command timed out: {method}")
+                raise
+
+        raise ConnectionError("Failed to send CDP command after reconnection attempt")
 
     async def _evaluate(self, expression: str) -> object:
         """Run Runtime.evaluate and return the value."""
@@ -353,7 +380,6 @@ class CometBridge:
 
         Returns dict with 'success' and 'method' keys.
         """
-        # Focus and select all existing content
         result = await self._evaluate(JS_FOCUS_AND_CLEAR)
         if not result or not result.get("success"):
             return {"success": False}
@@ -374,7 +400,10 @@ class CometBridge:
     # ── Connection ──
 
     async def connect(self) -> str:
-        """Connect to Comet's CDP interface. Find the Perplexity tab."""
+        """Connect to Comet's CDP interface. Find the Perplexity tab.
+
+        Tab priority: sidecar > home > search/thread > any non-blank page.
+        """
         try:
             targets = await self._http_get("/json/list")
         except Exception as e:
@@ -383,11 +412,12 @@ class CometBridge:
                 f"with --remote-debugging-port={self.port}."
             ) from e
 
-        # Find the best Perplexity tab — prefer sidecar (Comet assistant panel)
+        # Find the best Perplexity tab
         sidecar_target = None
         home_target = None
         search_target = None
         fallback_target = None
+
         for t in targets:
             if t.get("type") != "page":
                 continue
@@ -412,21 +442,35 @@ class CometBridge:
         if not ws_url:
             raise ConnectionError("No WebSocket URL for target tab.")
 
-        self.ws = await websockets.connect(ws_url, max_size=16 * 1024 * 1024)
+        # Close existing connection if any
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            self.ws = None
+
+        self.ws = await websockets.connect(ws_url, max_size=WS_MAX_SIZE)
 
         # Enable required CDP domains
         await self._send_cdp("Runtime.enable")
-        # Note: Input domain doesn't need explicit enable in most CDP implementations
 
         tab_url = target.get("url", "unknown")
-        log.info(f"Connected to Comet tab: {tab_url}")
+        self._target_url = tab_url
+        self._is_sidecar = "sidecar" in tab_url
+        log.info(f"Connected to Comet tab: {tab_url} (sidecar={self._is_sidecar})")
         return tab_url
 
     async def disconnect(self) -> None:
         """Clean up WebSocket connection."""
         if self.ws:
-            await self.ws.close()
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
             self.ws = None
+            self._target_url = None
+            self._is_sidecar = False
             log.info("Disconnected from Comet")
 
     async def is_connected(self) -> bool:
@@ -437,15 +481,39 @@ class CometBridge:
             val = await self._evaluate("1+1")
             return val == 2
         except Exception:
+            self.ws = None
             return False
 
     async def ensure_connected(self) -> None:
-        """Reconnect if needed."""
-        if not await self.is_connected():
-            await self.connect()
+        """Reconnect if needed, with retry logic."""
+        if await self.is_connected():
+            return
+
+        last_error = None
+        for attempt in range(MAX_RECONNECT_ATTEMPTS):
+            try:
+                await self.connect()
+                return
+            except ConnectionError as e:
+                last_error = e
+                if attempt < MAX_RECONNECT_ATTEMPTS - 1:
+                    wait = (attempt + 1) * 2
+                    log.warning(f"Connection attempt {attempt + 1} failed, retrying in {wait}s: {e}")
+                    await asyncio.sleep(wait)
+
+        raise last_error or ConnectionError("Failed to connect to Comet")
 
     async def _ensure_home_page(self) -> None:
-        """Navigate to Perplexity home if we're on a search/thread page."""
+        """Navigate to Perplexity home if we're on a search/thread page.
+
+        Sidecar tabs don't use /search/ URLs — they stay on the sidecar URL.
+        For sidecar, we just clear the input and we're good.
+        """
+        # Sidecar tabs don't navigate to /search/ — they have a different URL pattern
+        if self._is_sidecar:
+            log.debug("Sidecar tab — skipping home navigation (sidecar stays in-place)")
+            return
+
         try:
             current_url = await self._evaluate("window.location.href")
             needs_nav = False
@@ -454,6 +522,7 @@ class CometBridge:
                     if pattern in current_url:
                         needs_nav = True
                         break
+
             if needs_nav:
                 log.info("On a search/thread page, navigating to home for fresh prompt...")
                 await self._evaluate("window.location.href = 'https://www.perplexity.ai/'")
@@ -461,13 +530,11 @@ class CometBridge:
                 for _ in range(20):
                     await asyncio.sleep(0.5)
                     try:
-                        # Re-enable Runtime after navigation (page context resets)
                         await self._send_cdp("Runtime.enable")
                         url = await self._evaluate("window.location.href")
                         ready = await self._evaluate("document.readyState")
                         if url and "/search/" not in url and "/thread/" not in url and ready == "complete":
-                            # Wait a bit more for React to hydrate
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(1)  # Wait for React hydration
                             return
                     except Exception:
                         continue
@@ -478,11 +545,14 @@ class CometBridge:
     async def _wait_for_response_page(self, timeout: float = 30) -> None:
         """Wait for Perplexity to navigate to a response page after submission.
 
-        After submitting a query from the home page, Perplexity's SPA navigates
-        to a /search/... or /thread/... URL. During this navigation, the JS
-        Runtime context resets. We need to re-enable Runtime and confirm we're
-        on the response page before starting to poll for the answer.
+        For sidecar tabs, the response appears in-place without URL navigation,
+        so we just wait briefly for the response to start rendering.
         """
+        if self._is_sidecar:
+            # Sidecar doesn't navigate — just wait a moment for response to start
+            await asyncio.sleep(2)
+            return
+
         for i in range(int(timeout)):
             await asyncio.sleep(1)
             try:
@@ -490,10 +560,9 @@ class CometBridge:
                 url = await self._evaluate("window.location.href")
                 if url and ("/search/" in url or "/thread/" in url):
                     log.info(f"On response page after {i+1}s: {url[:80]}")
-                    await asyncio.sleep(1)  # brief settle time
+                    await asyncio.sleep(1)
                     return
             except Exception as e:
-                # Connection might be resetting during navigation
                 log.debug(f"Navigation wait [{i+1}s]: {e}")
                 continue
         log.warning("Timed out waiting for navigation to response page")
@@ -508,48 +577,36 @@ class CometBridge:
         await self.ensure_connected()
         await self._ensure_home_page()
 
-        # 1. Clear input and type text via CDP (works with Lexical editor)
         result = await self._clear_and_type(text)
         if not result or not result.get("success"):
             raise RuntimeError("Failed to type into Perplexity input. Is the page loaded?")
         log.info(f"Typed prompt ({result.get('method')}): {text[:60]}")
 
-        # 2. Verify text is in the input
         has_content = await self._evaluate(JS_CHECK_INPUT)
         if not has_content:
             raise RuntimeError("Prompt text not found in input — typing may have failed")
 
-        # 4. Submit: focus + Enter
         await self._evaluate(JS_FOCUS_INPUT)
-        await self._press_key("Enter")
+        await self._press_key("Enter", "Enter", 13)
         await asyncio.sleep(0.5)
 
-        # 5. Check if submission worked
         submitted = await self._evaluate(JS_CHECK_SUBMITTED)
         if not submitted:
-            # Fallback: click submit button
             await self._evaluate(JS_CLICK_SUBMIT)
             await asyncio.sleep(0.5)
             submitted = await self._evaluate(JS_CHECK_SUBMITTED)
             if not submitted:
-                # Last resort: Enter again
-                await self._press_key("Enter")
+                await self._press_key("Enter", "Enter", 13)
 
         log.info("Prompt submitted, waiting for response...")
 
-        # 6. Wait for navigation to response page
         await self._wait_for_response_page()
 
-        # 7. Poll for completion
         response = await self._poll_for_response()
         return response
 
     async def get_status(self) -> dict:
-        """Check if Computer is still working on a response.
-
-        Returns dict with keys: status ('idle'|'working'|'completed'),
-        currentStep (str), hasStopButton (bool).
-        """
+        """Check if Computer is still working on a response."""
         await self.ensure_connected()
         return await self._evaluate(JS_GET_STATUS)
 
@@ -559,13 +616,7 @@ class CometBridge:
         timeout: float = 300,
         on_status=None,
     ) -> str:
-        """Poll Perplexity until the response is complete.
-
-        Args:
-            poll_interval: Seconds between polls.
-            timeout: Max seconds to wait.
-            on_status: Optional async callback(status_dict) called each poll.
-        """
+        """Poll Perplexity until the response is complete."""
         elapsed = 0.0
         idle_after_submit = 0
         ever_saw_working = False
@@ -580,10 +631,12 @@ class CometBridge:
                 log.warning(f"Status poll error: {e}")
                 continue
 
-            if on_status:
+            if on_status and asyncio.iscoroutinefunction(on_status):
                 await on_status(status)
+            elif on_status:
+                on_status(status)
 
-            state = status.get("status", "idle")
+            state = status.get("status", "idle") if isinstance(status, dict) else "idle"
             log.debug(f"Poll [{elapsed:.0f}s]: state={state}")
 
             if state == "working":
@@ -591,28 +644,23 @@ class CometBridge:
                 ever_saw_working = True
 
             elif state == "completed":
-                # Extract and return the response
                 response = await self._evaluate(JS_EXTRACT_RESPONSE)
-                if response and len(response.strip()) > 0:
-                    log.info(f"Response received ({len(response)} chars)")
-                    return response.strip()
-                # Completed but empty — wait a bit more
+                if response and len(str(response).strip()) > 0:
+                    log.info(f"Response received ({len(str(response))} chars)")
+                    return str(response).strip()
                 await asyncio.sleep(1)
                 response = await self._evaluate(JS_EXTRACT_RESPONSE)
-                if response and len(response.strip()) > 0:
-                    return response.strip()
+                if response and len(str(response).strip()) > 0:
+                    return str(response).strip()
                 return "(Computer finished but returned no text)"
 
             elif state == "idle":
                 idle_after_submit += 1
-                # Be patient after submission — Perplexity takes several seconds
-                # to start showing working indicators after page navigation.
                 idle_patience = 10 if ever_saw_working else 30
                 if idle_after_submit > 5:
-                    # Check if there's prose content anyway (quick response)
                     response = await self._evaluate(JS_EXTRACT_RESPONSE)
-                    if response and len(response.strip()) > 0:
-                        return response.strip()
+                    if response and len(str(response).strip()) > 0:
+                        return str(response).strip()
                     if idle_after_submit > idle_patience:
                         return "(Computer didn't respond. Try again, man.)"
 
@@ -622,18 +670,10 @@ class CometBridge:
         """Send a prompt and yield status updates while waiting.
 
         This is the main entry point used by the API server.
-
-        Args:
-            text: The prompt to send.
-            status_callback: Optional async callable(status_dict) for progress updates.
-
-        Returns:
-            The complete response text.
         """
         await self.ensure_connected()
         await self._ensure_home_page()
 
-        # Clear and type via CDP
         result = await self._clear_and_type(text)
         if not result or not result.get("success"):
             raise RuntimeError("Failed to type into Perplexity input. Is the page loaded?")
@@ -642,7 +682,6 @@ class CometBridge:
         if not has_content:
             raise RuntimeError("Prompt text not found in input — typing may have failed")
 
-        # Submit via Enter
         await self._evaluate(JS_FOCUS_INPUT)
         await self._press_key("Enter", "Enter", 13)
         await asyncio.sleep(0.5)
@@ -655,8 +694,6 @@ class CometBridge:
             if not submitted:
                 await self._press_key("Enter", "Enter", 13)
 
-        # Wait for Perplexity to navigate to response page
         await self._wait_for_response_page()
 
-        # Poll with status callback
         return await self._poll_for_response(on_status=status_callback)
