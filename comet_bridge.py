@@ -383,7 +383,8 @@ class CometBridge:
                 f"with --remote-debugging-port={self.port}."
             ) from e
 
-        # Find the best Perplexity tab — prefer home page over search pages
+        # Find the best Perplexity tab — prefer sidecar (Comet assistant panel)
+        sidecar_target = None
         home_target = None
         search_target = None
         fallback_target = None
@@ -391,16 +392,17 @@ class CometBridge:
             if t.get("type") != "page":
                 continue
             url = t.get("url", "")
-            if "perplexity.ai" in url and "sidecar" not in url:
-                # Prefer the home page (fresh input) over existing searches
-                if url.rstrip("/").endswith("perplexity.ai") or "perplexity.ai/?" in url:
+            if "perplexity.ai" in url:
+                if "sidecar" in url:
+                    sidecar_target = t
+                elif url.rstrip("/").endswith("perplexity.ai") or "perplexity.ai/?" in url:
                     home_target = t
                 elif not search_target:
                     search_target = t
             elif url != "about:blank" and not url.startswith("chrome"):
                 fallback_target = t
 
-        target = home_target or search_target or fallback_target
+        target = sidecar_target or home_target or search_target or fallback_target
         if not target:
             raise ConnectionError(
                 "Navigate to perplexity.ai in Comet first, man."
