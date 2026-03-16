@@ -78,9 +78,13 @@ def sse(data: dict) -> str:
 
 
 def _build_prompt(user_message: str) -> str:
-    """Prefix the user message with The Dude persona instruction."""
-    if DUDE_PERSONA:
-        return f"{DUDE_PERSONA}\n\n{user_message}"
+    """Build the prompt to send to Perplexity.
+
+    NOTE: We do NOT inject the Dude persona here. Perplexity is a search
+    engine — it works best with clean, short queries. The Dude persona is
+    applied as a system-level instruction only when Perplexity supports it
+    (sidecar), or the persona flavoring happens post-response via TTS voice.
+    """
     return user_message
 
 
@@ -178,8 +182,10 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
                     yield sse({"type": "text", "chunk": "Couldn't type into Perplexity, man. Is the page loaded?"})
                     yield sse({"type": "done"})
                     return
+                log.info(f"Typed prompt via {result.get('method')}")
 
                 has_content = await bridge._evaluate(JS_CHECK_INPUT)
+                log.info(f"Input has content: {has_content}")
                 if not has_content:
                     yield sse({"type": "text", "chunk": "Typing failed, man. Try again."})
                     yield sse({"type": "done"})
@@ -190,12 +196,15 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
                 await asyncio.sleep(0.5)
 
                 submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
+                log.info(f"Submit check (Enter): {submitted}")
                 if not submitted:
                     await bridge._evaluate(JS_CLICK_SUBMIT)
                     await asyncio.sleep(0.5)
                     submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
+                    log.info(f"Submit check (click): {submitted}")
                     if not submitted:
                         await bridge._press_key("Enter", "Enter", 13)
+                        log.info("Sent second Enter as last resort")
 
             except Exception as e:
                 log.error(f"Submit error: {e}")
