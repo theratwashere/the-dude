@@ -836,15 +836,20 @@ function stopTalking() {
   mouthTarget = 0;
 }
 
-// ── MIC + VAD ──
-let mediaRecorder = null;
-let audioChunks = [];
+// ── MIC + SPEECH RECOGNITION ──
 let isRecording = false;
-let micStream = null;
-let vadAnalyser = null;
-let vadData = null;
-let silenceStart = null;
-let vadInterval = null;
+let recognition = null;
+
+function getSpeechRecognition() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) return null;
+  const r = new SR();
+  r.continuous = false;
+  r.interimResults = false;
+  r.lang = 'en-US';
+  r.maxAlternatives = 1;
+  return r;
+}
 
 async function startRecording() {
   ensureAudioCtx();
@@ -853,80 +858,60 @@ async function startRecording() {
     await new Promise(r => setTimeout(r, 50));
   }
 
+  recognition = getSpeechRecognition();
+  if (!recognition) {
+    setStatus('Speech recognition not supported, man');
+    setTimeout(() => setStatus(''), 3000);
+    return;
+  }
+
+  isRecording = true;
+  micBtn.classList.add('recording');
+  setStatus('Listening...');
+
+  recognition.onresult = (event) => {
+    const transcript = event.results[0][0].transcript;
+    console.log('You said:', transcript);
+    stopRecording();
+    if (transcript.trim()) {
+      sendMessage(transcript.trim());
+    }
+  };
+
+  recognition.onerror = (event) => {
+    console.error('Speech recognition error:', event.error);
+    stopRecording();
+    if (event.error === 'no-speech') {
+      setStatus('No speech detected, man');
+    } else if (event.error === 'not-allowed') {
+      setStatus('Mic access denied, man');
+    } else {
+      setStatus('Voice error: ' + event.error);
+    }
+    setTimeout(() => setStatus(''), 3000);
+  };
+
+  recognition.onend = () => {
+    if (isRecording) stopRecording();
+  };
+
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-    const micSource = audioCtx.createMediaStreamSource(micStream);
-    vadAnalyser = audioCtx.createAnalyser();
-    vadAnalyser.fftSize = 512;
-    vadData = new Float32Array(vadAnalyser.fftSize);
-    micSource.connect(vadAnalyser);
-
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus' : 'audio/webm';
-    mediaRecorder = new MediaRecorder(micStream, { mimeType });
-    audioChunks = [];
-
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) audioChunks.push(e.data);
-    };
-
-    mediaRecorder.onstop = async () => {
-      cleanupMic();
-      if (audioChunks.length === 0) return;
-      const blob = new Blob(audioChunks, { type: 'audio/webm' });
-      if (blob.size > 500) {
-        await sendVoiceBlob(blob);
-      }
-    };
-
-    mediaRecorder.start(100);
-    isRecording = true;
-    silenceStart = null;
-    micBtn.classList.add('recording');
-    setStatus('Listening...');
-
-    vadInterval = setInterval(checkVAD, 100);
+    recognition.start();
   } catch (err) {
     console.error('Mic error:', err);
     setStatus('Mic access denied, man');
     setTimeout(() => setStatus(''), 3000);
-  }
-}
-
-function checkVAD() {
-  if (!vadAnalyser || !isRecording) return;
-  vadAnalyser.getFloatTimeDomainData(vadData);
-  let rms = 0;
-  for (let i = 0; i < vadData.length; i++) rms += vadData[i] * vadData[i];
-  rms = Math.sqrt(rms / vadData.length);
-
-  if (rms < SILENCE_THRESHOLD) {
-    if (!silenceStart) silenceStart = Date.now();
-    else if (Date.now() - silenceStart > SILENCE_TIMEOUT_MS) {
-      stopRecording();
-    }
-  } else {
-    silenceStart = null;
+    stopRecording();
   }
 }
 
 function stopRecording() {
-  if (mediaRecorder && isRecording) {
-    isRecording = false;
-    micBtn.classList.remove('recording');
-    if (vadInterval) { clearInterval(vadInterval); vadInterval = null; }
-    try { mediaRecorder.stop(); } catch(e) {}
+  isRecording = false;
+  micBtn.classList.remove('recording');
+  if (recognition) {
+    try { recognition.stop(); } catch(e) {}
+    recognition = null;
   }
-}
-
-function cleanupMic() {
-  if (micStream) {
-    micStream.getTracks().forEach(t => t.stop());
-    micStream = null;
-  }
-  if (vadInterval) { clearInterval(vadInterval); vadInterval = null; }
-  vadAnalyser = null;
 }
 
 // ── EVENTS ──
