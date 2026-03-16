@@ -303,7 +303,9 @@ const API = "__PORT_8000__".startsWith("__") ? "" : "__PORT_8000__";
 const SILENCE_TIMEOUT_MS = 1800;
 const SILENCE_THRESHOLD = 0.015;
 const TEXT_FADE_DELAY = 4000;
-const VISITOR_ID = crypto.randomUUID();
+const VISITOR_ID = (typeof crypto !== 'undefined' && crypto.randomUUID)
+  ? crypto.randomUUID()
+  : 'v-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 const COMMON_HEADERS = { 'X-Visitor-Id': VISITOR_ID };
 
 // ── DOM ──
