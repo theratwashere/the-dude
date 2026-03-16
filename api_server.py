@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+from typing import List, Optional
 
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,8 +23,21 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from comet_bridge import CometBridge
-from generate_audio import generate_audio
-from transcribe_audio import transcribe_audio
+
+# Audio modules depend on internal pplx SDK — gracefully degrade if unavailable
+try:
+    from generate_audio import generate_audio
+    HAS_TTS = True
+except ImportError:
+    HAS_TTS = False
+    logging.getLogger("the-dude").warning("TTS unavailable (pplx SDK not installed)")
+
+try:
+    from transcribe_audio import transcribe_audio
+    HAS_STT = True
+except ImportError:
+    HAS_STT = False
+    logging.getLogger("the-dude").warning("STT unavailable (pplx SDK not installed)")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("the-dude")
@@ -59,7 +73,7 @@ def _build_prompt(user_message: str) -> str:
     return user_message
 
 
-async def stream_response(user_message: str, prefix_events: list[str] | None = None):
+async def stream_response(user_message: str, prefix_events: Optional[List[str]] = None):
     """SSE generator: sends status updates while Computer works, then text + audio."""
     t0 = time.time()
     log.info(f"User: {user_message[:100]}")
@@ -214,20 +228,21 @@ async def stream_response(user_message: str, prefix_events: list[str] | None = N
     llm_ms = int((time.time() - t0) * 1000)
     log.info(f"Computer ({llm_ms}ms): {full_text[:80]}")
 
-    # Generate TTS
-    try:
-        audio_bytes = await asyncio.wait_for(
-            generate_audio(full_text.strip(), voice="clyde", model="elevenlabs_tts_v3"),
-            timeout=15,
-        )
-        b64 = base64.b64encode(audio_bytes).decode()
-        yield sse({"type": "audio", "data": b64})
-        tts_ms = int((time.time() - t0) * 1000) - llm_ms
-        log.info(f"TTS ({tts_ms}ms)")
-    except asyncio.TimeoutError:
-        log.error("TTS timeout")
-    except Exception as e:
-        log.error(f"TTS error: {e}")
+    # Generate TTS (if pplx SDK available)
+    if HAS_TTS:
+        try:
+            audio_bytes = await asyncio.wait_for(
+                generate_audio(full_text.strip(), voice="clyde", model="elevenlabs_tts_v3"),
+                timeout=15,
+            )
+            b64 = base64.b64encode(audio_bytes).decode()
+            yield sse({"type": "audio", "data": b64})
+            tts_ms = int((time.time() - t0) * 1000) - llm_ms
+            log.info(f"TTS ({tts_ms}ms)")
+        except asyncio.TimeoutError:
+            log.error("TTS timeout")
+        except Exception as e:
+            log.error(f"TTS error: {e}")
 
     total = int((time.time() - t0) * 1000)
     log.info(f"Total: {total}ms")
@@ -259,6 +274,9 @@ async def voice(request: Request, audio: UploadFile = File(...)):
         return JSONResponse({"error": "Audio too large, man"}, status_code=413)
     content_type = audio.content_type or "audio/webm"
     log.info(f"Voice: {len(audio_bytes)} bytes")
+
+    if not HAS_STT:
+        return JSONResponse({"error": "Voice not available — pplx SDK not installed"}, status_code=501)
 
     try:
         result = await transcribe_audio(audio_bytes, media_type=content_type)
