@@ -80,15 +80,58 @@
     font-size: clamp(13px, 2.5vw, 16px);
     color: #00ff41;
     text-shadow: 0 0 6px rgba(0,255,65,0.5);
-    text-align: center;
+    text-align: left;
     max-width: 520px;
+    width: 100%;
     min-height: 22px;
+    max-height: 40vh;
+    overflow-y: auto;
     margin-bottom: 12px;
     opacity: 0;
     transition: opacity 0.4s ease;
     line-height: 1.5;
+    pointer-events: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0,255,65,0.3) transparent;
   }
+  #dude-text::-webkit-scrollbar { width: 4px; }
+  #dude-text::-webkit-scrollbar-track { background: transparent; }
+  #dude-text::-webkit-scrollbar-thumb { background: rgba(0,255,65,0.3); border-radius: 2px; }
   #dude-text.visible { opacity: 1; }
+
+  /* ── CODE BLOCKS ── */
+  #dude-text pre {
+    background: rgba(0, 10, 0, 0.85);
+    border: 1px solid rgba(0, 255, 65, 0.25);
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 6px 0;
+    overflow-x: auto;
+    font-size: clamp(11px, 2vw, 13px);
+    line-height: 1.4;
+    color: #00ff41;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0,255,65,0.2) transparent;
+  }
+  #dude-text pre::-webkit-scrollbar { height: 3px; }
+  #dude-text pre::-webkit-scrollbar-track { background: transparent; }
+  #dude-text pre::-webkit-scrollbar-thumb { background: rgba(0,255,65,0.2); border-radius: 2px; }
+
+  #dude-text code {
+    font-family: 'Courier New', monospace;
+    font-size: inherit;
+  }
+
+  /* Inline code */
+  #dude-text > code,
+  #dude-text p > code,
+  #dude-text span > code {
+    background: rgba(0, 10, 0, 0.6);
+    border: 1px solid rgba(0, 255, 65, 0.15);
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-size: 0.9em;
+  }
 
   #status-indicator {
     font-family: 'Courier New', monospace;
@@ -101,6 +144,33 @@
     text-align: center;
   }
   #status-indicator.visible { opacity: 1; }
+
+  /* ── WORKING/TOOL STATUS ── */
+  @keyframes pulse-green {
+    0%, 100% { opacity: 0.6; }
+    50% { opacity: 1; }
+  }
+  .working-status {
+    animation: pulse-green 1.5s ease-in-out infinite;
+  }
+
+  /* ── CODE MODE INDICATOR ── */
+  #code-mode-indicator {
+    position: fixed;
+    top: 12px;
+    right: 14px;
+    z-index: 20;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    color: rgba(0,255,65,0.2);
+    text-shadow: 0 0 4px rgba(0,255,65,0.1);
+    transition: all 0.4s ease;
+    pointer-events: none;
+  }
+  #code-mode-indicator.active {
+    color: rgba(0,255,65,0.8);
+    text-shadow: 0 0 8px rgba(0,255,65,0.5), 0 0 16px rgba(0,255,65,0.2);
+  }
 
   #input-row {
     display: flex; align-items: center; gap: 8px;
@@ -205,6 +275,8 @@
 <div id="vignette"></div>
 <div id="boot-screen"><pre id="boot-text"></pre></div>
 
+<div id="code-mode-indicator">&gt;_</div>
+
 <div id="chat-ui">
   <div id="dude-text" role="status" aria-live="polite"></div>
   <div id="status-indicator" role="status" aria-live="polite"></div>
@@ -249,6 +321,7 @@ const sendBtn = document.getElementById('send-btn');
 const micBtn = document.getElementById('mic-btn');
 const statusEl = document.getElementById('status-indicator');
 const dudeTextEl = document.getElementById('dude-text');
+const codeModeEl = document.getElementById('code-mode-indicator');
 
 // ── STATE ──
 let isBusy = false;
@@ -258,10 +331,11 @@ let volumeData = null;
 let isPlaying = false;
 let audioQueue = [];
 let playingAudio = false;
-let currentAudioEl = null;   // HTML5 Audio element for playback
-let currentSource = null;    // MediaElementSource for analyser
+let currentAudioEl = null;
+let currentSource = null;
 let abortController = null;
 let textFadeTimer = null;
+let isCodeMode = false;  // tracks if current response has code
 
 // ── AUDIO CONTEXT ──
 function ensureAudioCtx() {
@@ -269,7 +343,7 @@ function ensureAudioCtx() {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
-    analyser.smoothingTimeConstant = 0.3; // Lower = more responsive to syllables
+    analyser.smoothingTimeConstant = 0.3;
     volumeData = new Uint8Array(analyser.frequencyBinCount);
     analyser.connect(audioCtx.destination);
   }
@@ -283,28 +357,78 @@ function setStatus(text) {
   if (text === 'thinking') {
     statusEl.innerHTML = '<span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span>';
     statusEl.classList.add('visible');
+    statusEl.classList.remove('working-status');
+  } else if (text && text.includes('man...')) {
+    // Tool-use working status — pulsing style
+    statusEl.textContent = text;
+    statusEl.classList.add('visible', 'working-status');
   } else {
     statusEl.textContent = text || '';
     statusEl.classList.toggle('visible', !!text);
+    statusEl.classList.remove('working-status');
   }
+}
+
+// ── MARKDOWN RENDERING (minimal: code blocks + inline code) ──
+function renderMarkdown(text) {
+  // Escape HTML first
+  let html = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // Fenced code blocks: ```lang\n...\n```
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, function(match, lang, code) {
+    return '<pre><code>' + code.replace(/\n$/, '') + '</code></pre>';
+  });
+
+  // Inline code: `...`
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  // Convert newlines to <br> (but not inside <pre> blocks)
+  const parts = html.split(/(<pre>[\s\S]*?<\/pre>)/);
+  html = parts.map(part => {
+    if (part.startsWith('<pre>')) return part;
+    return part.replace(/\n/g, '<br>');
+  }).join('');
+
+  return html;
 }
 
 // ── DUDE TEXT ──
 function showDudeText(text) {
   if (textFadeTimer) clearTimeout(textFadeTimer);
-  dudeTextEl.textContent = text;
+
+  // Check if response contains code
+  const hasCode = text.includes('```') || text.includes('`');
+  if (hasCode && !isCodeMode) {
+    isCodeMode = true;
+    codeModeEl.classList.add('active');
+  }
+
+  dudeTextEl.innerHTML = renderMarkdown(text);
   dudeTextEl.classList.add('visible');
+
+  // Auto-scroll to bottom
+  dudeTextEl.scrollTop = dudeTextEl.scrollHeight;
 }
+
 function scheduleFadeDudeText() {
   if (textFadeTimer) clearTimeout(textFadeTimer);
+  // Longer fade delay for code-heavy responses
+  const delay = isCodeMode ? TEXT_FADE_DELAY * 3 : TEXT_FADE_DELAY;
   textFadeTimer = setTimeout(() => {
     dudeTextEl.classList.remove('visible');
-  }, TEXT_FADE_DELAY);
+    isCodeMode = false;
+    codeModeEl.classList.remove('active');
+  }, delay);
 }
 function clearDudeText() {
   if (textFadeTimer) clearTimeout(textFadeTimer);
-  dudeTextEl.textContent = '';
+  dudeTextEl.innerHTML = '';
   dudeTextEl.classList.remove('visible');
+  isCodeMode = false;
+  codeModeEl.classList.remove('active');
 }
 
 // ── INTERRUPT ──
@@ -459,6 +583,11 @@ async function processSSEStream(response) {
             if (fullText.length === event.chunk.length) setStatus('');
             break;
 
+          case 'status':
+            // Tool-use status updates from the backend
+            setStatus(event.message);
+            break;
+
           case 'audio':
             console.log('Audio event received:', event.data.length, 'chars');
             audioQueue.push(event.data);
@@ -519,25 +648,21 @@ async function drainAudioQueue() {
 function playAudioChunk(b64mp3) {
   return new Promise((resolve, reject) => {
     try {
-      // Create blob URL from base64
       const binary = atob(b64mp3);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
       const blob = new Blob([bytes], { type: 'audio/mp3' });
       const url = URL.createObjectURL(blob);
 
-      // Use HTML5 Audio element (more reliable cross-browser)
       const audio = new Audio();
       audio.crossOrigin = 'anonymous';
 
-      // Connect to Web Audio analyser for mouth sync
       let source = null;
       try {
         source = audioCtx.createMediaElementSource(audio);
         source.connect(analyser);
         currentSource = source;
       } catch (e) {
-        // If createMediaElementSource fails (e.g. CORS), play without analyser
         console.warn('Could not connect audio to analyser:', e);
       }
 
@@ -558,7 +683,6 @@ function playAudioChunk(b64mp3) {
         console.error('Audio element error:', e);
         URL.revokeObjectURL(url);
         currentAudioEl = null;
-        // Fallback: try Web Audio API decodeAudioData
         playViaWebAudioAPI(bytes.buffer.slice(0)).then(resolve).catch(reject);
       };
 
@@ -576,7 +700,6 @@ function playAudioChunk(b64mp3) {
   });
 }
 
-// Fallback: decode and play via Web Audio API BufferSource
 function playViaWebAudioAPI(arrayBuffer) {
   return new Promise((resolve, reject) => {
     audioCtx.decodeAudioData(arrayBuffer).then(audioBuffer => {
@@ -597,20 +720,17 @@ function playViaWebAudioAPI(arrayBuffer) {
 }
 
 // ── NATURAL MOUTH ANIMATION ──
-// Smooth physics-based mouth sync driven by audio amplitude
-// Uses crossfade between idle/talk images but with spring interpolation
-let mouthOpenness = 0;           // Current smoothed openness 0..1
-let mouthTarget = 0;             // Target openness from audio
-let mouthVelocity = 0;           // For spring physics
-let prevAmplitudes = [];         // Rolling history for envelope
-const MOUTH_OPEN_SPEED = 0.25;   // How fast mouth opens
-const MOUTH_CLOSE_SPEED = 0.10;  // How fast mouth closes (slower = more natural)
-const SPRING_DAMPING = 0.62;     // Spring damping factor
-const AMP_HISTORY = 5;           // Frames to average for envelope
-const NOISE_FLOOR = 10;          // Below this = silence
-const FULL_OPEN_LEVEL = 75;      // Amplitude for fully open mouth
+let mouthOpenness = 0;
+let mouthTarget = 0;
+let mouthVelocity = 0;
+let prevAmplitudes = [];
+const MOUTH_OPEN_SPEED = 0.25;
+const MOUTH_CLOSE_SPEED = 0.10;
+const SPRING_DAMPING = 0.62;
+const AMP_HISTORY = 5;
+const NOISE_FLOOR = 10;
+const FULL_OPEN_LEVEL = 75;
 
-// Track time-domain for plosive detection
 let timeDomainData = null;
 
 function ensureTimeDomainBuffer() {
@@ -623,8 +743,7 @@ function getAudioAmplitude() {
   if (!analyser || !volumeData) return 0;
   analyser.getByteFrequencyData(volumeData);
   ensureTimeDomainBuffer();
-  
-  // Speech frequency energy (bins 2-40 for 256 FFT ~= 340Hz-6900Hz)
+
   let speechSum = 0;
   const speechStart = 2;
   const speechEnd = Math.min(40, volumeData.length);
@@ -632,13 +751,11 @@ function getAudioAmplitude() {
     speechSum += volumeData[i];
   }
   const speechAvg = speechSum / (speechEnd - speechStart);
-  
-  // Overall energy for consonants/plosives
+
   let totalSum = 0;
   for (let i = 0; i < volumeData.length; i++) totalSum += volumeData[i];
   const totalAvg = totalSum / volumeData.length;
-  
-  // Time-domain peak for transient detection (plosives: p, b, t, d, k)
+
   let peak = 0;
   if (timeDomainData) {
     analyser.getByteTimeDomainData(timeDomainData);
@@ -647,29 +764,24 @@ function getAudioAmplitude() {
       if (v > peak) peak = v;
     }
   }
-  // Normalize peak to same scale as frequency data
   const peakNorm = (peak / 128) * 100;
-  
-  // Blend: prioritize speech freqs, let plosives punch through
+
   return Math.max(speechAvg, totalAvg * 0.7, peakNorm * 0.5);
 }
 
 function computeMouthTarget(amplitude) {
   prevAmplitudes.push(amplitude);
   if (prevAmplitudes.length > AMP_HISTORY) prevAmplitudes.shift();
-  
-  // Envelope: fast attack, slower release
+
   const envMax = Math.max(...prevAmplitudes);
   const envAvg = prevAmplitudes.reduce((a, b) => a + b, 0) / prevAmplitudes.length;
   const envValue = envMax * 0.55 + envAvg * 0.45;
-  
+
   if (envValue < NOISE_FLOOR) return 0;
-  
-  // Map to 0..1
+
   let t = (envValue - NOISE_FLOOR) / (FULL_OPEN_LEVEL - NOISE_FLOOR);
   t = Math.max(0, Math.min(1, t));
-  
-  // Smoothstep curve: snappy open, gradual close, natural intermediates
+
   return t * t * (3 - 2 * t);
 }
 
@@ -677,18 +789,16 @@ function updateMouthAnimation() {
   if (isPlaying && analyser && volumeData) {
     const amplitude = getAudioAmplitude();
     mouthTarget = computeMouthTarget(amplitude);
-    
-    // Spring-damped interpolation (asymmetric: fast open, slow close)
+
     const diff = mouthTarget - mouthOpenness;
     const speed = diff > 0 ? MOUTH_OPEN_SPEED : MOUTH_CLOSE_SPEED;
     mouthVelocity += diff * speed;
     mouthVelocity *= SPRING_DAMPING;
     mouthOpenness += mouthVelocity;
     mouthOpenness = Math.max(0, Math.min(1, mouthOpenness));
-    
+
     applyMouthVisuals(mouthOpenness);
   } else if (!isPlaying) {
-    // Ease back to closed when not playing
     if (mouthOpenness > 0.003) {
       mouthVelocity += (0 - mouthOpenness) * MOUTH_CLOSE_SPEED;
       mouthVelocity *= SPRING_DAMPING;
@@ -706,19 +816,14 @@ function updateMouthAnimation() {
 }
 
 function applyMouthVisuals(openness) {
-  // Crossfade between idle and talk images based on openness
-  // Use a power curve so low openness = very subtle, high = dramatic
   const talkOpacity = Math.pow(openness, 0.6);
   talkImg.style.opacity = String(talkOpacity);
-  
-  // Keep idle always at full — talk overlays on top
+
   idleImg.style.opacity = '1';
-  
-  // Add subtle jaw stretch via CSS transform on talk image
-  // This adds a bit of vertical "pull" that makes movement feel more physical
+
   if (openness > 0.05) {
-    const scaleY = 1 + openness * 0.012; // very subtle: up to 1.2% stretch
-    const translateY = openness * 0.3;    // tiny downward shift in %
+    const scaleY = 1 + openness * 0.012;
+    const translateY = openness * 0.3;
     talkImg.style.transform = `scaleY(${scaleY}) translateY(${translateY}%)`;
   } else {
     talkImg.style.transform = '';
@@ -949,6 +1054,7 @@ function boot() {
     '> CALIBRATING WHITE RUSSIAN SENSORS...',
     '> FINDING RUG THAT TIES ROOM TOGETHER...',
     '> CONNECTING TO COSMIC BOWLING ALLEY...',
+    '> LOADING CODING TOOLKIT, MAN...',
     '> THE DUDE ABIDES...',
   ];
   let shown = '';
