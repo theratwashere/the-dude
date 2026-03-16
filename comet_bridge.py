@@ -131,48 +131,89 @@ JS_CLICK_SUBMIT = """
 """
 
 # JavaScript: poll agent status — is Computer still working?
+# NOTE: Perplexity can have persistent animate-spin elements (sidebar/UI chrome)
+# that are NOT related to response generation. We must not treat those as "working".
+# The stop button is the most reliable "working" signal. Spinners are only trusted
+# when they appear inside the main content area, near the response.
 JS_GET_STATUS = """
 (() => {
     const body = document.body.innerText;
 
+    // Check for an active stop/cancel button (most reliable "working" indicator)
     let hasActiveStopButton = false;
     for (const btn of document.querySelectorAll('button')) {
-        const rect = btn.querySelector('rect');
         const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-        if ((rect || ariaLabel.includes('stop')) &&
+        const text = (btn.innerText || '').toLowerCase().trim();
+        // Stop buttons typically have aria-label with "stop" or contain a rect SVG icon
+        if ((ariaLabel.includes('stop') || ariaLabel.includes('cancel') ||
+             text === 'stop' || text === 'cancel') &&
             btn.offsetParent !== null && !btn.disabled) {
             hasActiveStopButton = true;
             break;
         }
     }
 
-    const hasLoadingSpinner = document.querySelector(
-        '[class*="animate-spin"], [class*="animate-pulse"]'
-    ) !== null;
-    const hasStepsCompleted = /\\d+ steps? completed/i.test(body);
-    const hasFinishedMarker = body.includes('Finished') && !hasActiveStopButton;
-    const hasReviewedSources = /Reviewed \\d+ sources?/i.test(body);
+    // Check for loading spinners ONLY within the main content area
+    // (ignore persistent sidebar/nav spinners)
+    const mainArea = document.querySelector('main') || document.body;
+    const mainSpinners = mainArea.querySelectorAll('[class*="animate-spin"]');
+    let hasActiveSpinner = false;
+    for (const el of mainSpinners) {
+        // Only count spinners that are NOT in nav/sidebar/header
+        if (!el.closest('nav, aside, header, footer') && el.offsetParent !== null) {
+            // Additional check: ignore tiny decorative spinners
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 4 && rect.height > 4) {
+                hasActiveSpinner = true;
+                break;
+            }
+        }
+    }
+
     const hasAskFollowUp = body.includes('Ask a follow-up');
     const hasProseContent = [...document.querySelectorAll('[class*="prose"]')].some(
-        el => el.innerText.trim().length > 0
+        el => el.innerText.trim().length > 20 && !el.closest('nav, aside, header, footer, form')
     );
+    const hasReviewedSources = /Reviewed \\d+ sources?/i.test(body);
+    const hasStepsCompleted = /\\d+ steps? completed/i.test(body);
+    const hasFinishedMarker = body.includes('Finished') && !hasActiveStopButton;
+    const hasSourceCount = /\\d+ sources?/.test(body);
 
+    // Check for active generation indicators in the text
+    // Be specific to avoid false positives from response content
+    // (e.g. 'Reading' matches 'Read my replies out loud')
     const workingPatterns = [
-        'Working', 'Searching', 'Reviewing sources', 'Preparing to assist',
-        'Clicking', 'Typing:', 'Navigating to', 'Reading', 'Analyzing'
+        'Preparing to assist', 'Reviewing sources', 'Searching the web',
+        'Clicking', 'Typing:', 'Navigating to', 'Analyzing'
     ];
     const hasWorkingText = workingPatterns.some(p => body.includes(p));
 
+    // Determine status with priority ordering:
+    // 1. Stop button = definitely working
+    // 2. "Ask a follow-up" + prose content = definitely completed
+    //    (this overrides spinners, which can be persistent UI elements)
+    // 3. Reviewed/Finished markers = completed
+    // 4. Active working text = working
+    // 5. Active content-area spinner (without completion markers) = working
+    // 6. Otherwise idle
     let status = 'idle';
-    if (hasActiveStopButton || hasLoadingSpinner) {
+    if (hasActiveStopButton) {
         status = 'working';
+    } else if (hasAskFollowUp && hasProseContent) {
+        status = 'completed';
     } else if (hasStepsCompleted || hasFinishedMarker) {
         status = 'completed';
-    } else if (hasReviewedSources && !hasWorkingText) {
+    } else if (hasReviewedSources && hasProseContent && !hasWorkingText) {
+        status = 'completed';
+    } else if (hasSourceCount && hasProseContent && !hasWorkingText && !hasActiveSpinner) {
         status = 'completed';
     } else if (hasWorkingText) {
         status = 'working';
-    } else if (hasAskFollowUp && hasProseContent && !hasActiveStopButton) {
+    } else if (hasActiveSpinner) {
+        status = 'working';
+    } else if (hasProseContent) {
+        // Has content but no follow-up prompt yet — might still be generating
+        // or might be a quick response. Mark as completed if no other working signals.
         status = 'completed';
     }
 
@@ -193,6 +234,7 @@ JS_GET_STATUS = """
 """
 
 # JavaScript: extract the response text from prose elements
+# Takes the LAST valid prose element (most recent response in a thread)
 JS_EXTRACT_RESPONSE = """
 (() => {
     const mainContent = document.querySelector('main') || document.body;
@@ -202,25 +244,36 @@ JS_EXTRACT_RESPONSE = """
     for (const el of allProseEls) {
         if (el.closest('nav, aside, header, footer, form')) continue;
         const text = el.innerText.trim();
+        // Skip UI chrome text
         const isUIText = ['Library', 'Discover', 'Spaces', 'Finance', 'Account',
-                          'Upgrade', 'Home', 'Search', 'Ask a follow-up'].some(
+                          'Upgrade', 'Home', 'Search', 'Ask a follow-up',
+                          'Sign in', 'Sign up', 'Continue with', 'Model'].some(
             ui => text.startsWith(ui)
         );
         if (isUIText) continue;
-        if (text.endsWith('?') && text.length < 100) continue;
-        if (text.length > 5) validProseTexts.push(text);
+        // Skip very short text that's likely a UI label
+        if (text.length <= 10) continue;
+        // Skip nested prose elements (child already captured)
+        const parent = el.parentElement;
+        if (parent && parent.matches && parent.matches('[class*="prose"]')) continue;
+        validProseTexts.push(text);
     }
 
+    // Take the last (most recent) response
     let response = '';
     if (validProseTexts.length > 0) {
         response = validProseTexts[validProseTexts.length - 1];
     }
 
     if (response) {
+        // Clean up UI artifacts that get included in innerText
         response = response.replace(
-            /View All|Show more|Ask a follow-up|\\d+ sources?/gi, ''
+            /View All|Show more|Ask a follow-up/gi, ''
         ).trim();
-        response = response.replace(/\\s+/g, ' ').trim();
+        // Remove source reference artifacts like "reddit" "vocabulary" "+1"
+        response = response.replace(/^(reddit|vocabulary|wikipedia|\+\d+)\s*/gim, '').trim();
+        // Collapse whitespace
+        response = response.replace(/\\n{3,}/g, '\\n\\n').trim();
     }
 
     return response.substring(0, 8000);
@@ -391,16 +444,24 @@ class CometBridge:
         """Navigate to Perplexity home if we're on a search/thread page."""
         try:
             current_url = await self._evaluate("window.location.href")
-            if current_url and "/search/" in current_url:
-                log.info("On a search page, navigating to home for fresh prompt...")
+            needs_nav = False
+            if current_url:
+                for pattern in ["/search/", "/thread/", "/t/"]:
+                    if pattern in current_url:
+                        needs_nav = True
+                        break
+            if needs_nav:
+                log.info("On a search/thread page, navigating to home for fresh prompt...")
                 await self._evaluate("window.location.href = 'https://www.perplexity.ai/'")
                 # Wait for navigation and page load
                 for _ in range(20):
                     await asyncio.sleep(0.5)
                     try:
+                        # Re-enable Runtime after navigation (page context resets)
+                        await self._send_cdp("Runtime.enable")
                         url = await self._evaluate("window.location.href")
                         ready = await self._evaluate("document.readyState")
-                        if url and "/search/" not in url and ready == "complete":
+                        if url and "/search/" not in url and "/thread/" not in url and ready == "complete":
                             # Wait a bit more for React to hydrate
                             await asyncio.sleep(1)
                             return
