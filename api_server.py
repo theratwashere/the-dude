@@ -104,9 +104,10 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
     yield sse({"type": "status", "message": "Computer's on it, man..."})
 
     try:
-        # Ensure connected before sending
+        # Ensure connected and on home page before sending
         try:
             await bridge.ensure_connected()
+            await bridge._ensure_home_page()
         except ConnectionError as e:
             yield sse({"type": "text", "chunk": str(e)})
             yield sse({"type": "done"})

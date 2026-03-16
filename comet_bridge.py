@@ -292,20 +292,24 @@ class CometBridge:
                 f"with --remote-debugging-port={self.port}."
             ) from e
 
-        # Find the Perplexity tab
-        perplexity_target = None
+        # Find the best Perplexity tab — prefer home page over search pages
+        home_target = None
+        search_target = None
         fallback_target = None
         for t in targets:
             if t.get("type") != "page":
                 continue
             url = t.get("url", "")
             if "perplexity.ai" in url and "sidecar" not in url:
-                perplexity_target = t
-                break
-            if url != "about:blank" and not url.startswith("chrome"):
+                # Prefer the home page (fresh input) over existing searches
+                if url.rstrip("/").endswith("perplexity.ai") or "perplexity.ai/?" in url:
+                    home_target = t
+                elif not search_target:
+                    search_target = t
+            elif url != "about:blank" and not url.startswith("chrome"):
                 fallback_target = t
 
-        target = perplexity_target or fallback_target
+        target = home_target or search_target or fallback_target
         if not target:
             raise ConnectionError(
                 "Navigate to perplexity.ai in Comet first, man."
@@ -347,6 +351,29 @@ class CometBridge:
         if not await self.is_connected():
             await self.connect()
 
+    async def _ensure_home_page(self) -> None:
+        """Navigate to Perplexity home if we're on a search/thread page."""
+        try:
+            current_url = await self._evaluate("window.location.href")
+            if current_url and "/search/" in current_url:
+                log.info("On a search page, navigating to home for fresh prompt...")
+                await self._evaluate("window.location.href = 'https://www.perplexity.ai/'")
+                # Wait for navigation and page load
+                for _ in range(20):
+                    await asyncio.sleep(0.5)
+                    try:
+                        url = await self._evaluate("window.location.href")
+                        ready = await self._evaluate("document.readyState")
+                        if url and "/search/" not in url and ready == "complete":
+                            # Wait a bit more for React to hydrate
+                            await asyncio.sleep(1)
+                            return
+                    except Exception:
+                        continue
+                log.warning("Navigation to home page timed out")
+        except Exception as e:
+            log.warning(f"Could not check/navigate URL: {e}")
+
     # ── Prompt Interaction ──
 
     async def send_prompt(self, text: str) -> str:
@@ -355,6 +382,7 @@ class CometBridge:
         Returns the response text from Perplexity.
         """
         await self.ensure_connected()
+        await self._ensure_home_page()
 
         # 1. Type text into the input
         js = JS_TYPE_TEXT.format(text_json=json.dumps(text))
