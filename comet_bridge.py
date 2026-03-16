@@ -172,7 +172,7 @@ JS_GET_STATUS = """
 
     const hasAskFollowUp = body.includes('Ask a follow-up');
     const hasProseContent = [...document.querySelectorAll('[class*="prose"]')].some(
-        el => el.innerText.trim().length > 20 && !el.closest('nav, aside, header, footer, form')
+        el => el.innerText.trim().length > 0 && !el.closest('nav, aside, header, footer, form')
     );
     const hasReviewedSources = /Reviewed \\d+ sources?/i.test(body);
     const hasStepsCompleted = /\\d+ steps? completed/i.test(body);
@@ -199,7 +199,9 @@ JS_GET_STATUS = """
     let status = 'idle';
     if (hasActiveStopButton) {
         status = 'working';
-    } else if (hasAskFollowUp && hasProseContent) {
+    } else if (hasAskFollowUp) {
+        // "Ask a follow-up" is the strongest completion signal — it only
+        // appears after Perplexity has finished generating the response.
         status = 'completed';
     } else if (hasStepsCompleted || hasFinishedMarker) {
         status = 'completed';
@@ -251,8 +253,8 @@ JS_EXTRACT_RESPONSE = """
             ui => text.startsWith(ui)
         );
         if (isUIText) continue;
-        // Skip very short text that's likely a UI label
-        if (text.length <= 10) continue;
+        // Skip empty text
+        if (text.length === 0) continue;
         // Skip nested prose elements (child already captured)
         const parent = el.parentElement;
         if (parent && parent.matches && parent.matches('[class*="prose"]')) continue;
@@ -589,13 +591,13 @@ class CometBridge:
             elif state == "completed":
                 # Extract and return the response
                 response = await self._evaluate(JS_EXTRACT_RESPONSE)
-                if response and len(response.strip()) > 5:
+                if response and len(response.strip()) > 0:
                     log.info(f"Response received ({len(response)} chars)")
                     return response.strip()
                 # Completed but empty — wait a bit more
                 await asyncio.sleep(1)
                 response = await self._evaluate(JS_EXTRACT_RESPONSE)
-                if response and len(response.strip()) > 5:
+                if response and len(response.strip()) > 0:
                     return response.strip()
                 return "(Computer finished but returned no text)"
 
@@ -607,7 +609,7 @@ class CometBridge:
                 if idle_after_submit > 5:
                     # Check if there's prose content anyway (quick response)
                     response = await self._evaluate(JS_EXTRACT_RESPONSE)
-                    if response and len(response.strip()) > 5:
+                    if response and len(response.strip()) > 0:
                         return response.strip()
                     if idle_after_submit > idle_patience:
                         return "(Computer didn't respond. Try again, man.)"

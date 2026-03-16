@@ -207,7 +207,7 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
 
             elif state == "completed":
                 response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
-                if response and len(response.strip()) > 5:
+                if response and len(response.strip()) > 0:
                     full_text = response.strip()
                 else:
                     await asyncio.sleep(1)
@@ -226,7 +226,7 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
                 idle_patience = 10 if ever_saw_working else 30
                 if idle_count > 5:
                     response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
-                    if response and len(response.strip()) > 5:
+                    if response and len(response.strip()) > 0:
                         full_text = response.strip()
                         break
                     if idle_count > idle_patience:
