@@ -56,7 +56,7 @@ JS_CHECK_INPUT = """
     if (el) {
         const text = el.innerText.trim();
         // Lexical empty state is just a newline; placeholder is in aria-placeholder
-        return text.length > 0 && text !== '\n';
+        return text.length > 0 && text !== String.fromCharCode(10);
     }
     const textarea = document.querySelector('textarea');
     if (textarea && textarea.value.trim().length > 0) return true;
@@ -299,7 +299,6 @@ class CometBridge:
         Returns dict with 'success' and 'method' keys.
         """
         # Focus and select all existing content
-        from comet_bridge import JS_FOCUS_AND_CLEAR
         result = await self._evaluate(JS_FOCUS_AND_CLEAR)
         if not result or not result.get("success"):
             return {"success": False}
