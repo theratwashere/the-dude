@@ -471,6 +471,29 @@ class CometBridge:
         except Exception as e:
             log.warning(f"Could not check/navigate URL: {e}")
 
+    async def _wait_for_response_page(self, timeout: float = 30) -> None:
+        """Wait for Perplexity to navigate to a response page after submission.
+
+        After submitting a query from the home page, Perplexity's SPA navigates
+        to a /search/... or /thread/... URL. During this navigation, the JS
+        Runtime context resets. We need to re-enable Runtime and confirm we're
+        on the response page before starting to poll for the answer.
+        """
+        for i in range(int(timeout)):
+            await asyncio.sleep(1)
+            try:
+                await self._send_cdp("Runtime.enable")
+                url = await self._evaluate("window.location.href")
+                if url and ("/search/" in url or "/thread/" in url):
+                    log.info(f"On response page after {i+1}s: {url[:80]}")
+                    await asyncio.sleep(1)  # brief settle time
+                    return
+            except Exception as e:
+                # Connection might be resetting during navigation
+                log.debug(f"Navigation wait [{i+1}s]: {e}")
+                continue
+        log.warning("Timed out waiting for navigation to response page")
+
     # ── Prompt Interaction ──
 
     async def send_prompt(self, text: str) -> str:
@@ -510,7 +533,10 @@ class CometBridge:
 
         log.info("Prompt submitted, waiting for response...")
 
-        # 6. Poll for completion
+        # 6. Wait for navigation to response page
+        await self._wait_for_response_page()
+
+        # 7. Poll for completion
         response = await self._poll_for_response()
         return response
 
@@ -624,6 +650,9 @@ class CometBridge:
             submitted = await self._evaluate(JS_CHECK_SUBMITTED)
             if not submitted:
                 await self._press_key("Enter", "Enter", 13)
+
+        # Wait for Perplexity to navigate to response page
+        await self._wait_for_response_page()
 
         # Poll with status callback
         return await self._poll_for_response(on_status=status_callback)

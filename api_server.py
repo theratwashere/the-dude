@@ -149,6 +149,27 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
             yield sse({"type": "done"})
             return
 
+        # Wait for Perplexity to start processing (URL changes to /search/)
+        # After submission, the SPA may navigate to a new URL. We need to
+        # wait for this and re-enable Runtime for the new page context.
+        submit_wait = 0
+        while submit_wait < 30:  # up to 30 seconds
+            await asyncio.sleep(1)
+            submit_wait += 1
+            try:
+                await bridge._send_cdp("Runtime.enable")
+                current_url = await bridge._evaluate("window.location.href")
+                log.info(f"Post-submit URL [{submit_wait}s]: {current_url}")
+                if current_url and ("/search/" in current_url or "/thread/" in current_url):
+                    # Perplexity accepted the query and navigated to response page
+                    log.info("Submission confirmed — on response page")
+                    await asyncio.sleep(1)  # brief settle time
+                    break
+            except Exception as e:
+                log.warning(f"Post-submit check error: {e}")
+                # Connection might be resetting during navigation, keep trying
+                continue
+
         # Poll for response, yielding status updates via SSE
         elapsed = 0.0
         poll_interval = 2.0
