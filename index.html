@@ -48,6 +48,38 @@
   #face-idle { opacity: 1; position: absolute; }
   #face-talk { opacity: 0; position: absolute; pointer-events: none; will-change: opacity, transform; }
 
+  /* ── MOUTH SVG OVERLAY ── */
+  #mouth-overlay {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 1;
+    pointer-events: none;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #mouth-svg {
+    position: absolute;
+    filter: drop-shadow(0 0 6px rgba(0,255,65,0.6)) drop-shadow(0 0 12px rgba(0,255,65,0.3));
+  }
+  #mouth-svg path, #mouth-svg ellipse, #mouth-svg line, #mouth-svg rect {
+    transition: none; /* We animate via JS interpolation */
+  }
+
+  /* ── BLINK OVERLAY ── */
+  #blink-overlay {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 1;
+    pointer-events: none;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #blink-bar {
+    position: absolute;
+    background: rgba(0, 0, 0, 0.85);
+    border-radius: 2px;
+    opacity: 0;
+    will-change: opacity;
+  }
+
   #rain-overlay {
     position: fixed; top: 0; left: 0;
     width: 100%; height: 100%;
@@ -270,6 +302,14 @@
   <img id="face-idle" src="dude-idle.png" alt="The Dude">
   <img id="face-talk" src="dude-talk.png" alt="The Dude talking">
 </div>
+<div id="mouth-overlay">
+  <svg id="mouth-svg" viewBox="0 0 120 80" xmlns="http://www.w3.org/2000/svg">
+    <!-- Mouth shapes drawn dynamically via JS -->
+  </svg>
+</div>
+<div id="blink-overlay">
+  <div id="blink-bar"></div>
+</div>
 <canvas id="rain-overlay"></canvas>
 <div id="scanlines"></div>
 <div id="vignette"></div>
@@ -447,6 +487,9 @@ function interruptDude() {
   mouthOpenness = 0;
   mouthVelocity = 0;
   prevAmplitudes = [];
+  visemeWeights = { A: 1, B: 0, C: 0, D: 0, E: 0, F: 0 };
+  visemeTargets = { A: 1, B: 0, C: 0, D: 0, E: 0, F: 0 };
+  smoothBands = { sub: 0, low: 0, lowMid: 0, mid: 0, high: 0, veryHigh: 0 };
   talkImg.style.opacity = '0';
   talkImg.style.transform = '';
   idleImg.style.opacity = '1';
@@ -721,120 +764,389 @@ function playViaWebAudioAPI(arrayBuffer) {
   });
 }
 
-// ── NATURAL MOUTH ANIMATION ──
+// ── VISEME MOUTH ANIMATION SYSTEM ──
+// 6 Preston-Blair mouth shapes driven by frequency-band analysis
+const mouthSvg = document.getElementById('mouth-svg');
+const blinkBar = document.getElementById('blink-bar');
+const NOISE_FLOOR = 10;
+const FULL_OPEN_LEVEL = 75;
+
+// Smoothed viseme weights (A-F), each 0..1
+let visemeWeights = { A: 1, B: 0, C: 0, D: 0, E: 0, F: 0 };
+let visemeTargets = { A: 1, B: 0, C: 0, D: 0, E: 0, F: 0 };
+// Smoothed band energies for hysteresis
+let smoothBands = { sub: 0, low: 0, lowMid: 0, mid: 0, high: 0, veryHigh: 0 };
+// Legacy compat
 let mouthOpenness = 0;
 let mouthTarget = 0;
 let mouthVelocity = 0;
 let prevAmplitudes = [];
-const MOUTH_OPEN_SPEED = 0.25;
-const MOUTH_CLOSE_SPEED = 0.10;
-const SPRING_DAMPING = 0.62;
-const AMP_HISTORY = 5;
-const NOISE_FLOOR = 10;
-const FULL_OPEN_LEVEL = 75;
+
+// Idle animation state
+let idleSwayPhase = Math.random() * Math.PI * 2;
+let nextBlinkTime = performance.now() + 2000 + Math.random() * 4000;
+let blinkActive = false;
+let blinkStartTime = 0;
+const BLINK_DURATION = 150; // ms
 
 let timeDomainData = null;
-
 function ensureTimeDomainBuffer() {
   if (!timeDomainData && analyser) {
     timeDomainData = new Uint8Array(analyser.fftSize);
   }
 }
 
+// ── FREQUENCY BAND ANALYSIS ──
+// With 256 FFT and ~44100Hz sample rate, each bin ≈ 172Hz
+// Bin mapping: bin_index = freq / (sampleRate / fftSize)
+function getFrequencyBands() {
+  if (!analyser || !volumeData) return { sub: 0, low: 0, lowMid: 0, mid: 0, high: 0, veryHigh: 0, total: 0 };
+  analyser.getByteFrequencyData(volumeData);
+
+  const sr = (audioCtx && audioCtx.sampleRate) || 44100;
+  const binHz = sr / analyser.fftSize; // ~172Hz per bin
+
+  function bandEnergy(loHz, hiHz) {
+    const loBin = Math.max(0, Math.floor(loHz / binHz));
+    const hiBin = Math.min(volumeData.length - 1, Math.ceil(hiHz / binHz));
+    if (hiBin <= loBin) return 0;
+    let sum = 0;
+    for (let i = loBin; i <= hiBin; i++) sum += volumeData[i];
+    return sum / (hiBin - loBin + 1);
+  }
+
+  const sub     = bandEnergy(60, 200);
+  const low     = bandEnergy(200, 500);
+  const lowMid  = bandEnergy(500, 1000);
+  const mid     = bandEnergy(1000, 2500);
+  const high    = bandEnergy(2500, 4000);
+  const veryHigh = bandEnergy(4000, 8000);
+
+  // Overall energy for amplitude
+  let totalSum = 0;
+  for (let i = 0; i < volumeData.length; i++) totalSum += volumeData[i];
+  const total = totalSum / volumeData.length;
+
+  return { sub, low, lowMid, mid, high, veryHigh, total };
+}
+
+// Legacy-compatible amplitude for talk image overlay
 function getAudioAmplitude() {
   if (!analyser || !volumeData) return 0;
-  analyser.getByteFrequencyData(volumeData);
-  ensureTimeDomainBuffer();
-
+  // volumeData already filled by getFrequencyBands
   let speechSum = 0;
   const speechStart = 2;
   const speechEnd = Math.min(40, volumeData.length);
-  for (let i = speechStart; i < speechEnd; i++) {
-    speechSum += volumeData[i];
+  for (let i = speechStart; i < speechEnd; i++) speechSum += volumeData[i];
+  return speechSum / (speechEnd - speechStart);
+}
+
+// ── VISEME WEIGHT COMPUTATION ──
+// Maps frequency bands → 6 mouth shape weights
+function computeVisemeWeights(bands) {
+  const { sub, low, lowMid, mid, high, veryHigh, total } = bands;
+
+  // Normalize bands to 0..1 range (frequency data is 0..255)
+  const nSub     = sub / 255;
+  const nLow     = low / 255;
+  const nLowMid  = lowMid / 255;
+  const nMid     = mid / 255;
+  const nHigh    = high / 255;
+  const nVHigh   = veryHigh / 255;
+  const nTotal   = total / 255;
+
+  // Smooth the band energies for stability
+  const smooth = 0.3; // lower = more responsive
+  smoothBands.sub     = smoothBands.sub * smooth + nSub * (1 - smooth);
+  smoothBands.low     = smoothBands.low * smooth + nLow * (1 - smooth);
+  smoothBands.lowMid  = smoothBands.lowMid * smooth + nLowMid * (1 - smooth);
+  smoothBands.mid     = smoothBands.mid * smooth + nMid * (1 - smooth);
+  smoothBands.high    = smoothBands.high * smooth + nHigh * (1 - smooth);
+  smoothBands.veryHigh = smoothBands.veryHigh * smooth + nVHigh * (1 - smooth);
+
+  const s = smoothBands;
+  const energy = (s.sub + s.low + s.lowMid + s.mid + s.high + s.veryHigh) / 6;
+
+  // Below noise floor → silent (A)
+  if (energy < NOISE_FLOOR / 255) {
+    return { A: 1, B: 0, C: 0, D: 0, E: 0, F: 0 };
   }
-  const speechAvg = speechSum / (speechEnd - speechStart);
 
-  let totalSum = 0;
-  for (let i = 0; i < volumeData.length; i++) totalSum += volumeData[i];
-  const totalAvg = totalSum / volumeData.length;
+  // Raw shape scores based on frequency band patterns
+  // B: closed consonants (M/B/P) — low energy in low bands, low total
+  const bScore = Math.max(0, s.sub * 0.5 + s.low * 0.3 - s.mid * 0.3 - s.high * 0.3) * (energy < 0.25 ? 2 : 0.5);
 
-  let peak = 0;
-  if (timeDomainData) {
-    analyser.getByteTimeDomainData(timeDomainData);
-    for (let i = 0; i < timeDomainData.length; i++) {
-      const v = Math.abs(timeDomainData[i] - 128);
-      if (v > peak) peak = v;
+  // C: open vowels (AH/AA) — strong low + low-mid
+  const cScore = Math.max(0, (s.low * 0.5 + s.lowMid * 0.5) - s.high * 0.2);
+
+  // D: narrow vowels (E/I) — strong mid, less low
+  const dScore = Math.max(0, s.mid * 0.6 + s.lowMid * 0.3 - s.low * 0.2);
+
+  // E: round vowels (O/U) — strong low, less mid
+  const eScore = Math.max(0, s.low * 0.6 + s.sub * 0.3 - s.mid * 0.3);
+
+  // F: fricatives (F/TH/S) — strong high + very-high
+  const fScore = Math.max(0, s.high * 0.5 + s.veryHigh * 0.5);
+
+  // Normalize to weights that sum to ~1
+  const total2 = bScore + cScore + dScore + eScore + fScore;
+  if (total2 < 0.01) {
+    return { A: 1, B: 0, C: 0, D: 0, E: 0, F: 0 };
+  }
+
+  const scale = 1 / total2;
+  return {
+    A: 0, // Not silent if we got here
+    B: bScore * scale,
+    C: cScore * scale,
+    D: dScore * scale,
+    E: eScore * scale,
+    F: fScore * scale,
+  };
+}
+
+// ── SVG MOUTH SHAPE DEFINITIONS ──
+// Each shape is defined as SVG path data in a 120x80 viewBox
+// Shapes are designed in Matrix green aesthetic
+const MOUTH_SHAPES = {
+  // A: Thin horizontal line (lips together, neutral)
+  A: { d: 'M 25,40 Q 60,42 95,40', fill: 'none', strokeWidth: 2.5 },
+  // B: Small pursed shape (closed consonants M/B/P)
+  B: { d: 'M 40,35 Q 50,30 60,35 Q 68,40 60,45 Q 50,50 40,45 Q 32,40 40,35 Z', fill: 'rgba(0,255,65,0.08)', strokeWidth: 2 },
+  // C: Wide tall oval (open AH)
+  C: { d: 'M 25,30 Q 60,10 95,30 Q 105,45 95,55 Q 60,72 25,55 Q 15,45 25,30 Z', fill: 'rgba(0,255,65,0.12)', strokeWidth: 2.5 },
+  // D: Medium wide, not as tall (E/I)
+  D: { d: 'M 28,35 Q 60,25 92,35 Q 98,42 92,48 Q 60,56 28,48 Q 22,42 28,35 Z', fill: 'rgba(0,255,65,0.10)', strokeWidth: 2 },
+  // E: Small round circle (O/U)
+  E: { d: 'M 42,30 Q 52,22 62,30 Q 70,40 62,50 Q 52,58 42,50 Q 34,40 42,30 Z', fill: 'rgba(0,255,65,0.10)', strokeWidth: 2 },
+  // F: Wide horizontal, teeth showing (F/S/TH)
+  F: {
+    d: 'M 22,35 Q 60,30 98,35 Q 102,40 98,45 Q 60,50 22,45 Q 18,40 22,35 Z',
+    fill: 'rgba(0,255,65,0.06)', strokeWidth: 2,
+    teeth: 'M 35,38 L 45,38 L 45,42 L 35,42 Z M 50,37 L 60,37 L 60,42 L 50,42 Z M 65,37 L 75,37 L 75,42 L 65,42 Z M 80,38 L 88,38 L 88,42 L 80,42 Z'
+  },
+};
+
+// ── SVG MOUTH RENDERING ──
+// Interpolates between mouth shapes based on viseme weights
+function renderMouthSVG(weights) {
+  // Find the two strongest visemes for blending
+  let sorted = Object.entries(weights)
+    .filter(([k]) => k !== 'A')
+    .sort((a, b) => b[1] - a[1]);
+
+  const totalNonA = sorted.reduce((s, [, w]) => s + w, 0);
+  const aWeight = weights.A || 0;
+
+  // Position the SVG relative to the image
+  // Portrait is 1024x1536, displayed as object-fit:contain
+  // Mouth area is ~55-60% down, centered
+  positionMouthSVG();
+
+  // Clear previous
+  let svgContent = '';
+  const green = '#00ff41';
+
+  if (totalNonA < 0.05) {
+    // Mostly silent: show shape A
+    const shape = MOUTH_SHAPES.A;
+    svgContent = `<path d="${shape.d}" fill="${shape.fill || 'none'}" stroke="${green}" stroke-width="${shape.strokeWidth}" stroke-linecap="round" opacity="0.7"/>`;
+  } else {
+    // Blend the shapes — draw each with its weight as opacity
+    // Start with A at its weight
+    if (aWeight > 0.05) {
+      const shapeA = MOUTH_SHAPES.A;
+      svgContent += `<path d="${shapeA.d}" fill="none" stroke="${green}" stroke-width="${shapeA.strokeWidth}" stroke-linecap="round" opacity="${(aWeight * 0.7).toFixed(3)}"/>`;
+    }
+
+    // Draw non-A shapes weighted by their scores
+    for (const [key, weight] of sorted) {
+      if (weight < 0.02) continue;
+      const shape = MOUTH_SHAPES[key];
+      const opacity = Math.min(1, weight * 1.2); // slightly boost for visibility
+      svgContent += `<path d="${shape.d}" fill="${shape.fill || 'none'}" stroke="${green}" stroke-width="${shape.strokeWidth}" stroke-linecap="round" opacity="${opacity.toFixed(3)}"/>`;
+      if (shape.teeth && weight > 0.3) {
+        svgContent += `<path d="${shape.teeth}" fill="rgba(0,255,65,0.15)" stroke="${green}" stroke-width="0.5" opacity="${(weight * 0.6).toFixed(3)}"/>`;
+      }
     }
   }
-  const peakNorm = (peak / 128) * 100;
 
-  return Math.max(speechAvg, totalAvg * 0.7, peakNorm * 0.5);
+  mouthSvg.innerHTML = svgContent;
 }
 
-function computeMouthTarget(amplitude) {
-  prevAmplitudes.push(amplitude);
-  if (prevAmplitudes.length > AMP_HISTORY) prevAmplitudes.shift();
+// ── MOUTH POSITIONING ──
+// Calculates where the mouth should be on screen based on portrait dimensions
+function positionMouthSVG() {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
 
-  const envMax = Math.max(...prevAmplitudes);
-  const envAvg = prevAmplitudes.reduce((a, b) => a + b, 0) / prevAmplitudes.length;
-  const envValue = envMax * 0.55 + envAvg * 0.45;
+  // Portrait is 1024x1536, displayed as object-fit:contain
+  const imgAspect = 1024 / 1536;
+  const vpAspect = vw / vh;
 
-  if (envValue < NOISE_FLOOR) return 0;
-
-  let t = (envValue - NOISE_FLOOR) / (FULL_OPEN_LEVEL - NOISE_FLOOR);
-  t = Math.max(0, Math.min(1, t));
-
-  return t * t * (3 - 2 * t);
-}
-
-function updateMouthAnimation() {
-  if (isPlaying && analyser && volumeData) {
-    const amplitude = getAudioAmplitude();
-    mouthTarget = computeMouthTarget(amplitude);
-
-    const diff = mouthTarget - mouthOpenness;
-    const speed = diff > 0 ? MOUTH_OPEN_SPEED : MOUTH_CLOSE_SPEED;
-    mouthVelocity += diff * speed;
-    mouthVelocity *= SPRING_DAMPING;
-    mouthOpenness += mouthVelocity;
-    mouthOpenness = Math.max(0, Math.min(1, mouthOpenness));
-
-    applyMouthVisuals(mouthOpenness);
-  } else if (!isPlaying) {
-    if (mouthOpenness > 0.003) {
-      mouthVelocity += (0 - mouthOpenness) * MOUTH_CLOSE_SPEED;
-      mouthVelocity *= SPRING_DAMPING;
-      mouthOpenness += mouthVelocity;
-      mouthOpenness = Math.max(0, mouthOpenness);
-      applyMouthVisuals(mouthOpenness);
-    } else {
-      mouthOpenness = 0;
-      mouthVelocity = 0;
-      talkImg.style.opacity = '0';
-      idleImg.style.opacity = '1';
-    }
+  let imgW, imgH, imgX, imgY;
+  if (vpAspect > imgAspect) {
+    // Viewport wider than image → image fills height
+    imgH = vh;
+    imgW = vh * imgAspect;
+    imgX = (vw - imgW) / 2;
+    imgY = 0;
+  } else {
+    // Viewport taller than image → image fills width
+    imgW = vw;
+    imgH = vw / imgAspect;
+    imgX = 0;
+    imgY = (vh - imgH) / 2;
   }
-  requestAnimationFrame(updateMouthAnimation);
+
+  // Mouth position: ~57% down, centered horizontally in the portrait
+  const mouthCenterX = imgX + imgW * 0.50;
+  const mouthCenterY = imgY + imgH * 0.575;
+  const mouthWidth = imgW * 0.12;   // mouth is ~12% of image width
+  const mouthHeight = mouthWidth * (80 / 120); // preserve viewBox ratio
+
+  mouthSvg.style.width = mouthWidth + 'px';
+  mouthSvg.style.height = mouthHeight + 'px';
+  mouthSvg.style.left = (mouthCenterX - mouthWidth / 2) + 'px';
+  mouthSvg.style.top = (mouthCenterY - mouthHeight / 2) + 'px';
+
+  // Also position blink bar over eye area (~38% down)
+  const eyeCenterY = imgY + imgH * 0.38;
+  const eyeWidth = imgW * 0.28;
+  const eyeHeight = imgH * 0.025;
+  blinkBar.style.width = eyeWidth + 'px';
+  blinkBar.style.height = eyeHeight + 'px';
+  blinkBar.style.left = (imgX + imgW * 0.50 - eyeWidth / 2) + 'px';
+  blinkBar.style.top = (eyeCenterY - eyeHeight / 2) + 'px';
 }
 
-function applyMouthVisuals(openness) {
-  const talkOpacity = Math.pow(openness, 0.6);
+// ── TALK IMAGE OVERLAY ──
+// Still use talk image as subtle overlay for jaw/face movement during high amplitude
+function applyTalkOverlay(amplitude) {
+  const norm = Math.max(0, Math.min(1, (amplitude - NOISE_FLOOR) / (FULL_OPEN_LEVEL - NOISE_FLOOR)));
+  // Subtle overlay: max 40% opacity, only at high amplitude
+  const talkOpacity = Math.pow(norm, 1.2) * 0.4;
   talkImg.style.opacity = String(talkOpacity);
-
   idleImg.style.opacity = '1';
 
-  if (openness > 0.05) {
-    const scaleY = 1 + openness * 0.012;
-    const translateY = openness * 0.3;
+  if (norm > 0.05) {
+    const scaleY = 1 + norm * 0.008;
+    const translateY = norm * 0.2;
     talkImg.style.transform = `scaleY(${scaleY}) translateY(${translateY}%)`;
   } else {
     talkImg.style.transform = '';
   }
 }
 
+// ── IDLE ANIMATIONS ──
+function updateIdleAnimations(now) {
+  const faceLayer = document.getElementById('face-layer');
+
+  // Head sway — sinusoidal, very subtle
+  idleSwayPhase += 0.003; // slow period ~5-6s
+  const swayX = Math.sin(idleSwayPhase) * 1.5 + Math.sin(idleSwayPhase * 0.7) * 0.5;
+  const swayRot = Math.sin(idleSwayPhase * 0.8) * 0.3;
+
+  // More movement when speaking
+  const speakMult = isPlaying ? 1.8 : 1.0;
+  const totalX = swayX * speakMult + (crtGlitchX || 0);
+  const breathScale = getBreathingScaleY();
+  faceLayer.style.transform = `translateX(${totalX}px) rotate(${swayRot * speakMult}deg) scaleY(${breathScale})`;
+
+  // Eye blinks
+  if (!blinkActive && now >= nextBlinkTime) {
+    blinkActive = true;
+    blinkStartTime = now;
+    blinkBar.style.opacity = '1';
+  }
+
+  if (blinkActive) {
+    const elapsed = now - blinkStartTime;
+    if (elapsed >= BLINK_DURATION) {
+      blinkActive = false;
+      blinkBar.style.opacity = '0';
+      // Schedule next blink: 3-6s
+      nextBlinkTime = now + 3000 + Math.random() * 3000;
+    } else {
+      // Smooth blink curve: quick close then open
+      const t = elapsed / BLINK_DURATION;
+      const blinkOpacity = t < 0.4 ? (t / 0.4) : (1 - (t - 0.4) / 0.6);
+      blinkBar.style.opacity = String(Math.pow(blinkOpacity, 0.5) * 0.85);
+    }
+  }
+}
+
+// ── ENHANCED BREATHING ──
+// Add subtle scaleY to face layer for breathing effect
+function getBreathingScaleY() {
+  return 1.0 + 0.003 * Math.sin(breathPhase * 0.5);
+}
+
+// ── MAIN ANIMATION UPDATE ──
+function updateMouthAnimation() {
+  const now = performance.now();
+
+  if (isPlaying && analyser && volumeData) {
+    const bands = getFrequencyBands();
+    const amplitude = getAudioAmplitude();
+
+    // Compute viseme targets from frequency bands
+    visemeTargets = computeVisemeWeights(bands);
+
+    // Smooth interpolation toward targets (fast attack, slow release)
+    for (const key of ['A', 'B', 'C', 'D', 'E', 'F']) {
+      const diff = visemeTargets[key] - visemeWeights[key];
+      const speed = diff > 0 ? 0.25 : 0.12;
+      visemeWeights[key] += diff * speed;
+      visemeWeights[key] = Math.max(0, Math.min(1, visemeWeights[key]));
+    }
+
+    // Render SVG mouth
+    renderMouthSVG(visemeWeights);
+
+    // Subtle talk image overlay for jaw movement
+    applyTalkOverlay(amplitude);
+
+    // Legacy compat
+    mouthOpenness = 1 - visemeWeights.A;
+
+  } else if (!isPlaying) {
+    // Ease visemes back to A (silent)
+    let anyActive = false;
+    for (const key of ['B', 'C', 'D', 'E', 'F']) {
+      if (visemeWeights[key] > 0.005) {
+        visemeWeights[key] *= 0.88; // decay
+        anyActive = true;
+      } else {
+        visemeWeights[key] = 0;
+      }
+    }
+    visemeWeights.A = 1 - (visemeWeights.B + visemeWeights.C + visemeWeights.D + visemeWeights.E + visemeWeights.F);
+
+    renderMouthSVG(visemeWeights);
+
+    if (!anyActive) {
+      talkImg.style.opacity = '0';
+      talkImg.style.transform = '';
+      idleImg.style.opacity = '1';
+      mouthOpenness = 0;
+    } else {
+      applyTalkOverlay(mouthOpenness * FULL_OPEN_LEVEL);
+    }
+  }
+
+  // Idle animations always run
+  updateIdleAnimations(now);
+
+  requestAnimationFrame(updateMouthAnimation);
+}
+
 function stopTalking() {
   mouthTarget = 0;
 }
+
+// Reposition on resize
+window.addEventListener('resize', positionMouthSVG);
 
 // ── MIC + SPEECH RECOGNITION ──
 let isRecording = false;
@@ -1011,6 +1323,7 @@ function updateBreathing() {
 }
 
 // ── CRT ──
+let crtGlitchX = 0;
 function crtEffects() {
   const layer = document.getElementById('face-layer');
   if (Math.random() > 0.97) {
@@ -1018,9 +1331,8 @@ function crtEffects() {
     setTimeout(() => { layer.style.opacity = '1'; }, 25 + Math.random() * 60);
   }
   if (Math.random() > 0.994) {
-    const shift = (Math.random() - 0.5) * 10;
-    layer.style.transform = `translateX(${shift}px)`;
-    setTimeout(() => { layer.style.transform = ''; }, 35 + Math.random() * 80);
+    crtGlitchX = (Math.random() - 0.5) * 10;
+    setTimeout(() => { crtGlitchX = 0; }, 35 + Math.random() * 80);
   }
   requestAnimationFrame(crtEffects);
 }
