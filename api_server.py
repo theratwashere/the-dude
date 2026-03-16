@@ -17,7 +17,10 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 from anthropic import Anthropic
@@ -25,7 +28,7 @@ from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from generate_audio import generate_audio
 from transcribe_audio import transcribe_audio
@@ -50,39 +53,61 @@ Rules:
 - You're aware you're a digital presence (on a screen, in the matrix) and find it pretty far out.
 """
 
-conversations: dict[str, list[dict]] = {}
 MAX_HISTORY = 20
+MAX_VISITORS = 200
+MAX_MESSAGE_LEN = 2000
+
+_conversations: OrderedDict[str, list[dict]] = OrderedDict()
+_conv_lock = threading.Lock()
 
 
 def get_visitor_id(request: Request) -> str:
-    return request.headers.get("x-visitor-id", request.client.host or "default")
+    visitor = request.headers.get("x-visitor-id", "")
+    if not visitor:
+        visitor = request.client.host if request.client else "default"
+    return visitor[:64]
 
 
 def sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
+def _get_history(visitor_id: str) -> list[dict]:
+    """Get or create conversation history for a visitor (thread-safe)."""
+    with _conv_lock:
+        if visitor_id not in _conversations:
+            # Evict oldest visitor if at capacity
+            while len(_conversations) >= MAX_VISITORS:
+                _conversations.popitem(last=False)
+            _conversations[visitor_id] = []
+        else:
+            # Move to end (most recently used)
+            _conversations.move_to_end(visitor_id)
+        return _conversations[visitor_id]
+
+
 def _llm_worker(visitor_id: str, user_message: str, queue: asyncio.Queue, loop):
     """Sync LLM streaming in thread. Pushes SSE events to queue."""
-    if visitor_id not in conversations:
-        conversations[visitor_id] = []
+    history = _get_history(visitor_id)
 
-    history = conversations[visitor_id]
     history.append({"role": "user", "content": user_message})
+    # Keep history bounded; trim from the front, preserving user/assistant pairs
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
+        # Ensure history starts with a user message (not an orphaned assistant reply)
+        while history and history[0]["role"] != "user":
+            history.pop(0)
 
     full_text = ""
     try:
         with client.messages.stream(
-            model="claude_haiku_4_5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=200,
             system=DUDE_SYSTEM,
             messages=history,
         ) as stream:
             for chunk in stream.text_stream:
                 full_text += chunk
-                # Push text event to the async queue from the thread
                 asyncio.run_coroutine_threadsafe(
                     queue.put(sse({"type": "text", "chunk": chunk})),
                     loop,
@@ -110,24 +135,31 @@ async def stream_response(visitor_id: str, user_message: str, prefix_events: lis
         for e in prefix_events:
             yield e
 
-    queue = asyncio.Queue()
-    loop = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
 
     # Start LLM in thread
     future = loop.run_in_executor(
         executor, _llm_worker, visitor_id, user_message, queue, loop
     )
 
-    # Drain text events from queue as they arrive
-    full_text = ""
+    # Drain text events from queue as they arrive.
+    # Use a sentinel (None) pushed by _llm_worker on error, or check future
+    # completion *after* draining the queue to avoid missing final events.
     while True:
-        # Check if LLM thread is done
-        if future.done() and queue.empty():
-            break
-
         try:
-            event = await asyncio.wait_for(queue.get(), timeout=0.1)
+            event = await asyncio.wait_for(queue.get(), timeout=0.2)
         except asyncio.TimeoutError:
+            # No event yet — check if the worker is done
+            if future.done():
+                # Drain any remaining events
+                while not queue.empty():
+                    event = queue.get_nowait()
+                    if event is None:
+                        yield sse({"type": "done"})
+                        return
+                    yield event
+                break
             continue
 
         if event is None:  # sentinel for error
@@ -170,14 +202,14 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_LEN)
 
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request):
     visitor_id = get_visitor_id(request)
     return StreamingResponse(
-        stream_response(visitor_id, req.message),
+        stream_response(visitor_id, req.message.strip()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -187,6 +219,8 @@ async def chat(req: ChatRequest, request: Request):
 async def voice(request: Request, audio: UploadFile = File(...)):
     visitor_id = get_visitor_id(request)
     audio_bytes = await audio.read()
+    if len(audio_bytes) > 10 * 1024 * 1024:  # 10 MB limit
+        return JSONResponse({"error": "Audio too large, man"}, status_code=413)
     content_type = audio.content_type or "audio/webm"
     log.info(f"[{visitor_id}] Voice: {len(audio_bytes)} bytes")
 
@@ -214,7 +248,6 @@ async def health():
     return {"status": "The Dude abides"}
 
 # Serve static files (index.html, images, etc.) from the same directory
-import os
 app.mount("/", StaticFiles(directory=os.path.dirname(os.path.abspath(__file__)), html=True), name="static")
 
 

@@ -26,6 +26,16 @@ from pplx.python.sdks.llm_api import (
 )
 
 
+_client: LLMAPIClient | None = None
+
+
+def _get_client() -> LLMAPIClient:
+    global _client
+    if _client is None:
+        _client = LLMAPIClient()
+    return _client
+
+
 async def transcribe_audio(
     audio_bytes: bytes,
     *,
@@ -36,7 +46,9 @@ async def transcribe_audio(
     language: str | None = None,
     model: str = "elevenlabs_scribe_v2",
 ) -> dict:
-    client = LLMAPIClient()
+    if not audio_bytes:
+        raise ValueError("Cannot transcribe empty audio")
+    client = _get_client()
     b64 = base64.b64encode(audio_bytes).decode()
     convo = Conversation()
     convo.add_user(AudioBlock(source=AudioSource(media_type=media_type, data=b64)))

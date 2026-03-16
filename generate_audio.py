@@ -25,6 +25,15 @@ from pplx.python.sdks.llm_api import (
 
 TTS_OUTPUT_FORMAT = "mp3_44100_128"
 
+_client: LLMAPIClient | None = None
+
+
+def _get_client() -> LLMAPIClient:
+    global _client
+    if _client is None:
+        _client = LLMAPIClient()
+    return _client
+
 
 async def generate_audio(
     text: str,
@@ -32,7 +41,9 @@ async def generate_audio(
     voice: str = "kore",
     model: str = "gemini_2_5_pro_tts",
 ) -> bytes:
-    client = LLMAPIClient()
+    if not text or not text.strip():
+        raise ValueError("Cannot generate audio from empty text")
+    client = _get_client()
     convo = Conversation()
     convo.set_single_audio_prompt(text)
 
@@ -56,7 +67,9 @@ async def generate_dialogue(
     *,
     model: str = "gemini_2_5_pro_tts",
 ) -> bytes:
-    client = LLMAPIClient()
+    if not dialogue:
+        raise ValueError("Cannot generate dialogue from empty list")
+    client = _get_client()
     inputs = [DialogueInput(voice=d["speaker"], text=d["text"]) for d in dialogue]
     convo = Conversation()
     convo.set_dialogue_prompt(inputs)
