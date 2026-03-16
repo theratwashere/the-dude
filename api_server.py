@@ -115,19 +115,15 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
 
         # Type and submit the prompt
         try:
-            js_text_json = json.dumps(prompt)
-            from comet_bridge import JS_TYPE_TEXT, JS_CHECK_INPUT, JS_FOCUS_INPUT
+            from comet_bridge import JS_CHECK_INPUT, JS_FOCUS_INPUT
             from comet_bridge import JS_CHECK_SUBMITTED, JS_CLICK_SUBMIT
             from comet_bridge import JS_GET_STATUS, JS_EXTRACT_RESPONSE
 
-            js = JS_TYPE_TEXT.format(text_json=js_text_json)
-            result = await bridge._evaluate(js)
+            result = await bridge._clear_and_type(prompt)
             if not result or not result.get("success"):
                 yield sse({"type": "text", "chunk": "Couldn't type into Perplexity, man. Is the page loaded?"})
                 yield sse({"type": "done"})
                 return
-
-            await asyncio.sleep(0.5)
 
             has_content = await bridge._evaluate(JS_CHECK_INPUT)
             if not has_content:
@@ -136,7 +132,7 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
                 return
 
             await bridge._evaluate(JS_FOCUS_INPUT)
-            await bridge._press_key("Enter")
+            await bridge._press_key("Enter", "Enter", 13)
             await asyncio.sleep(0.5)
 
             submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
@@ -145,7 +141,7 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
                 await asyncio.sleep(0.5)
                 submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
                 if not submitted:
-                    await bridge._press_key("Enter")
+                    await bridge._press_key("Enter", "Enter", 13)
 
         except Exception as e:
             log.error(f"Submit error: {e}")

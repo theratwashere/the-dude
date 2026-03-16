@@ -24,33 +24,40 @@ INPUT_SELECTORS = [
     'input[type="text"]',
 ]
 
-# JavaScript: type text into Perplexity's input field
-JS_TYPE_TEXT = """
-(() => {{
-    const text = {text_json};
+# JavaScript: focus and clear the Perplexity input (works with Lexical editor)
+JS_FOCUS_AND_CLEAR = """
+(() => {
     const el = document.querySelector('[contenteditable="true"]');
-    if (el) {{
+    if (el) {
         el.focus();
-        document.execCommand('selectAll', false, null);
-        document.execCommand('insertText', false, text);
-        return {{ success: true, method: 'contenteditable' }};
-    }}
+        el.click();
+        // Select all content for deletion
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return { success: true, method: 'contenteditable' };
+    }
     const textarea = document.querySelector('textarea');
-    if (textarea) {{
+    if (textarea) {
         textarea.focus();
-        textarea.value = text;
-        textarea.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        return {{ success: true, method: 'textarea' }};
-    }}
-    return {{ success: false }};
-}})()
+        textarea.select();
+        return { success: true, method: 'textarea' };
+    }
+    return { success: false };
+})()
 """
 
-# JavaScript: check if text was typed into the input
+# JavaScript: check if text was typed into the input (ignore placeholder)
 JS_CHECK_INPUT = """
 (() => {
     const el = document.querySelector('[contenteditable="true"]');
-    if (el && el.innerText.trim().length > 0) return true;
+    if (el) {
+        const text = el.innerText.trim();
+        // Lexical empty state is just a newline; placeholder is in aria-placeholder
+        return text.length > 0 && text !== '\n';
+    }
     const textarea = document.querySelector('textarea');
     if (textarea && textarea.value.trim().length > 0) return true;
     return false;
@@ -271,14 +278,44 @@ class CometBridge:
             raise RuntimeError(f"JS error: {inner.get('description', inner)}")
         return inner.get("value")
 
-    async def _press_key(self, key: str) -> None:
+    async def _press_key(self, key: str, code: str = "", key_code: int = 0) -> None:
         """Dispatch a key press via CDP Input domain."""
-        await self._send_cdp("Input.dispatchKeyEvent", {
-            "type": "keyDown", "key": key,
-        })
-        await self._send_cdp("Input.dispatchKeyEvent", {
-            "type": "keyUp", "key": key,
-        })
+        params = {"type": "keyDown", "key": key}
+        if code:
+            params["code"] = code
+        if key_code:
+            params["windowsVirtualKeyCode"] = key_code
+        await self._send_cdp("Input.dispatchKeyEvent", params)
+        params["type"] = "keyUp"
+        await self._send_cdp("Input.dispatchKeyEvent", params)
+
+    async def _insert_text(self, text: str) -> None:
+        """Insert text via CDP Input.insertText — works with Lexical/React editors."""
+        await self._send_cdp("Input.insertText", {"text": text})
+
+    async def _clear_and_type(self, text: str) -> dict:
+        """Focus the input, clear it, and type text using CDP.
+
+        Returns dict with 'success' and 'method' keys.
+        """
+        # Focus and select all existing content
+        from comet_bridge import JS_FOCUS_AND_CLEAR
+        result = await self._evaluate(JS_FOCUS_AND_CLEAR)
+        if not result or not result.get("success"):
+            return {"success": False}
+
+        method = result.get("method", "unknown")
+        await asyncio.sleep(0.1)
+
+        # Delete selected content
+        await self._press_key("Backspace", "Backspace", 8)
+        await asyncio.sleep(0.2)
+
+        # Type the new text
+        await self._insert_text(text)
+        await asyncio.sleep(0.3)
+
+        return {"success": True, "method": method}
 
     # ── Connection ──
 
@@ -384,17 +421,13 @@ class CometBridge:
         await self.ensure_connected()
         await self._ensure_home_page()
 
-        # 1. Type text into the input
-        js = JS_TYPE_TEXT.format(text_json=json.dumps(text))
-        result = await self._evaluate(js)
+        # 1. Clear input and type text via CDP (works with Lexical editor)
+        result = await self._clear_and_type(text)
         if not result or not result.get("success"):
             raise RuntimeError("Failed to type into Perplexity input. Is the page loaded?")
         log.info(f"Typed prompt ({result.get('method')}): {text[:60]}")
 
-        # 2. Wait for React to process
-        await asyncio.sleep(0.5)
-
-        # 3. Verify text is in the input
+        # 2. Verify text is in the input
         has_content = await self._evaluate(JS_CHECK_INPUT)
         if not has_content:
             raise RuntimeError("Prompt text not found in input — typing may have failed")
@@ -500,21 +533,20 @@ class CometBridge:
             The complete response text.
         """
         await self.ensure_connected()
+        await self._ensure_home_page()
 
-        # Type and submit
-        js = JS_TYPE_TEXT.format(text_json=json.dumps(text))
-        result = await self._evaluate(js)
+        # Clear and type via CDP
+        result = await self._clear_and_type(text)
         if not result or not result.get("success"):
             raise RuntimeError("Failed to type into Perplexity input. Is the page loaded?")
-
-        await asyncio.sleep(0.5)
 
         has_content = await self._evaluate(JS_CHECK_INPUT)
         if not has_content:
             raise RuntimeError("Prompt text not found in input — typing may have failed")
 
+        # Submit via Enter
         await self._evaluate(JS_FOCUS_INPUT)
-        await self._press_key("Enter")
+        await self._press_key("Enter", "Enter", 13)
         await asyncio.sleep(0.5)
 
         submitted = await self._evaluate(JS_CHECK_SUBMITTED)
@@ -523,7 +555,7 @@ class CometBridge:
             await asyncio.sleep(0.5)
             submitted = await self._evaluate(JS_CHECK_SUBMITTED)
             if not submitted:
-                await self._press_key("Enter")
+                await self._press_key("Enter", "Enter", 13)
 
         # Poll with status callback
         return await self._poll_for_response(on_status=status_callback)
