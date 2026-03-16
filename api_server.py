@@ -195,21 +195,22 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
                 await bridge._evaluate(JS_FOCUS_INPUT)
                 click_result = await bridge._evaluate(JS_CLICK_SUBMIT)
                 log.info(f"Submit click result: {click_result}")
-                await asyncio.sleep(1.0)
 
-                submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
-                log.info(f"Submit check (after click): {submitted}")
-                if not submitted:
-                    # Fallback: try Enter key
+                if not click_result:
+                    # Click didn't find a button — try Enter key instead
+                    log.info("No submit button found, trying Enter key")
                     await bridge._evaluate(JS_FOCUS_INPUT)
                     await bridge._press_key("Enter", "Enter", 13)
                     await asyncio.sleep(0.5)
-                    submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
-                    log.info(f"Submit check (after Enter): {submitted}")
-                    if not submitted:
-                        # Last resort: click again
-                        await bridge._evaluate(JS_CLICK_SUBMIT)
-                        log.info("Sent second click as last resort")
+                    # Try clicking once more as last resort
+                    await bridge._evaluate(JS_CLICK_SUBMIT)
+                    log.info("Sent Enter + click as fallback")
+
+                # DON'T check JS_CHECK_SUBMITTED here — after a successful
+                # click, Perplexity often starts navigating immediately,
+                # which destroys the Runtime context and causes evaluate()
+                # to hang. Proceed straight to URL polling instead.
+                log.info("Submit sent, moving to URL polling...")
 
             except Exception as e:
                 log.error(f"Submit error: {e}")
@@ -235,11 +236,12 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
                         url = t.get("url", "")
                         if "perplexity.ai" in url and ("/search/" in url or "/thread/" in url):
                             # Check if this is a FRESH search (not an old one)
-                            # by looking for the query slug in the URL
-                            slug = prompt[:30].lower().replace(" ", "-")
-                            slug_words = prompt.lower().split()[:3]
+                            # by looking for the query slug in the URL.
+                            # Strip punctuation, use words >= 2 chars.
+                            import re as _re
+                            slug_words = _re.sub(r"[^\w\s]", "", prompt.lower()).split()[:4]
                             url_lower = url.lower()
-                            if any(w in url_lower for w in slug_words if len(w) > 2):
+                            if any(w in url_lower for w in slug_words if len(w) >= 2):
                                 log.info(f"Post-submit URL [{submit_wait}s]: {url}")
                                 log.info("Submission confirmed — on response page")
                                 search_url_found = True

@@ -634,6 +634,17 @@ async function drainAudioQueue() {
   playingAudio = true;
   ensureAudioCtx();
 
+  // Safety timeout: if audio hangs for 30s, force recovery
+  const safetyTimer = setTimeout(() => {
+    console.warn('Audio drain safety timeout — forcing recovery');
+    audioQueue.length = 0;
+    playingAudio = false;
+    isPlaying = false;
+    stopTalking();
+    scheduleFadeDudeText();
+    setBusy(false);
+  }, 30000);
+
   while (audioQueue.length > 0) {
     const item = audioQueue.shift();
     try {
@@ -643,6 +654,7 @@ async function drainAudioQueue() {
     }
   }
 
+  clearTimeout(safetyTimer);
   playingAudio = false;
   isPlaying = false;
   stopTalking();
