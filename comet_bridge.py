@@ -28,25 +28,45 @@ INPUT_SELECTORS = [
 # ── JavaScript Fragments ──
 # These are evaluated in the Perplexity tab via CDP Runtime.evaluate
 
-# Focus and clear the Perplexity input (works with Lexical editor)
+# Focus and FULLY clear the Perplexity input (works with Lexical editor)
+# Lexical uses a contenteditable div with internal React state. We must:
+# 1. Focus the element
+# 2. Select ALL content (Cmd+A / Ctrl+A equivalent)
+# 3. Delete it via execCommand or key events
+# 4. Verify it's empty before returning
 JS_FOCUS_AND_CLEAR = """
 (() => {
     const el = document.querySelector('[contenteditable="true"]');
     if (el) {
         el.focus();
         el.click();
+        // Method 1: selectAll via document.execCommand
+        document.execCommand('selectAll', false, null);
+        // Method 2: Range-based selectAll as backup
         const range = document.createRange();
         range.selectNodeContents(el);
         const sel = window.getSelection();
         sel.removeAllRanges();
         sel.addRange(range);
-        return { success: true, method: 'contenteditable' };
+        // Delete selected content
+        document.execCommand('delete', false, null);
+        // If still has content, try innerHTML clear (triggers React reconciliation)
+        const remaining = el.innerText.trim();
+        if (remaining.length > 1) {
+            // Force clear via multiple approaches
+            el.innerHTML = '';
+            // Dispatch input event to notify React/Lexical of the change
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        return { success: true, method: 'contenteditable', cleared: el.innerText.trim().length <= 1 };
     }
     const textarea = document.querySelector('textarea');
     if (textarea) {
         textarea.focus();
         textarea.select();
-        return { success: true, method: 'textarea' };
+        textarea.value = '';
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        return { success: true, method: 'textarea', cleared: true };
     }
     return { success: false };
 })()
@@ -385,11 +405,56 @@ class CometBridge:
             return {"success": False}
 
         method = result.get("method", "unknown")
+        cleared = result.get("cleared", False)
         await asyncio.sleep(0.1)
 
-        # Delete selected content
-        await self._press_key("Backspace", "Backspace", 8)
-        await asyncio.sleep(0.2)
+        if not cleared:
+            # JS clear didn't fully work — try keyboard-based clear
+            # Select all via Cmd+A (macOS) then delete
+            await self._send_cdp("Input.dispatchKeyEvent", {
+                "type": "keyDown", "key": "a", "code": "KeyA",
+                "windowsVirtualKeyCode": 65, "modifiers": 4,  # 4 = Meta (Cmd on Mac)
+            })
+            await self._send_cdp("Input.dispatchKeyEvent", {
+                "type": "keyUp", "key": "a", "code": "KeyA",
+                "windowsVirtualKeyCode": 65, "modifiers": 4,
+            })
+            await asyncio.sleep(0.1)
+            await self._press_key("Backspace", "Backspace", 8)
+            await asyncio.sleep(0.2)
+
+            # Verify cleared
+            check = await self._evaluate("""
+                (() => {
+                    const el = document.querySelector('[contenteditable="true"]');
+                    if (el) return el.innerText.trim().length;
+                    const ta = document.querySelector('textarea');
+                    if (ta) return ta.value.trim().length;
+                    return -1;
+                })()
+            """)
+            if check and check > 1:
+                log.warning(f"Input still has {check} chars after clear attempts")
+                # Nuclear option: set innerHTML empty
+                await self._evaluate("""
+                    (() => {
+                        const el = document.querySelector('[contenteditable="true"]');
+                        if (el) {
+                            el.innerHTML = '<p><br></p>';
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                        }
+                    })()
+                """)
+                await asyncio.sleep(0.2)
+
+        # Re-focus before typing
+        await self._evaluate("""
+            (() => {
+                const el = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea');
+                if (el) { el.focus(); el.click(); }
+            })()
+        """)
+        await asyncio.sleep(0.1)
 
         # Type the new text
         await self._insert_text(text)

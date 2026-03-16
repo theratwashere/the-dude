@@ -191,20 +191,25 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
                     yield sse({"type": "done"})
                     return
 
+                # Try clicking the Submit button directly first (more reliable)
                 await bridge._evaluate(JS_FOCUS_INPUT)
-                await bridge._press_key("Enter", "Enter", 13)
-                await asyncio.sleep(0.5)
+                click_result = await bridge._evaluate(JS_CLICK_SUBMIT)
+                log.info(f"Submit click result: {click_result}")
+                await asyncio.sleep(1.0)
 
                 submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
-                log.info(f"Submit check (Enter): {submitted}")
+                log.info(f"Submit check (after click): {submitted}")
                 if not submitted:
-                    await bridge._evaluate(JS_CLICK_SUBMIT)
+                    # Fallback: try Enter key
+                    await bridge._evaluate(JS_FOCUS_INPUT)
+                    await bridge._press_key("Enter", "Enter", 13)
                     await asyncio.sleep(0.5)
                     submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
-                    log.info(f"Submit check (click): {submitted}")
+                    log.info(f"Submit check (after Enter): {submitted}")
                     if not submitted:
-                        await bridge._press_key("Enter", "Enter", 13)
-                        log.info("Sent second Enter as last resort")
+                        # Last resort: click again
+                        await bridge._evaluate(JS_CLICK_SUBMIT)
+                        log.info("Sent second click as last resort")
 
             except Exception as e:
                 log.error(f"Submit error: {e}")
