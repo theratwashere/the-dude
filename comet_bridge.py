@@ -288,8 +288,9 @@ JS_EXTRACT_RESPONSE = """
 # Maximum WebSocket message size (16MB)
 WS_MAX_SIZE = 16 * 1024 * 1024
 
-# CDP response timeout
-CDP_TIMEOUT = 30
+# CDP response timeout (seconds). Keep reasonably short so navigation-time
+# polls don't block the event loop for ages.
+CDP_TIMEOUT = 10
 
 # Maximum reconnection attempts
 MAX_RECONNECT_ATTEMPTS = 3

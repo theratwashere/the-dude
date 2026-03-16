@@ -217,38 +217,107 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
                 yield sse({"type": "done"})
                 return
 
-            # Wait for Perplexity to start processing (URL changes to /search/)
+            # Wait for Perplexity to navigate to /search/ after submission.
+            # IMPORTANT: During page navigation, the Runtime context is destroyed
+            # and Runtime.evaluate hangs until the new page loads. Instead of
+            # evaluating JS (which can block for CDP_TIMEOUT=30s per attempt),
+            # we poll the CDP HTTP /json/list endpoint which returns tab URLs
+            # without needing an active execution context.
             submit_wait = 0
-            while submit_wait < 30:
+            search_url_found = False
+            while submit_wait < 15:
                 await asyncio.sleep(1)
                 submit_wait += 1
                 try:
-                    await bridge._send_cdp("Runtime.enable")
-                    current_url = await bridge._evaluate("window.location.href")
-                    log.info(f"Post-submit URL [{submit_wait}s]: {current_url}")
-                    if current_url and ("/search/" in current_url or "/thread/" in current_url):
-                        log.info("Submission confirmed — on response page")
-                        await asyncio.sleep(1)
+                    # Poll tab URLs via HTTP — doesn't depend on Runtime context
+                    targets = await bridge._http_get("/json/list")
+                    for t in targets:
+                        url = t.get("url", "")
+                        if "perplexity.ai" in url and ("/search/" in url or "/thread/" in url):
+                            # Check if this is a FRESH search (not an old one)
+                            # by looking for the query slug in the URL
+                            slug = prompt[:30].lower().replace(" ", "-")
+                            slug_words = prompt.lower().split()[:3]
+                            url_lower = url.lower()
+                            if any(w in url_lower for w in slug_words if len(w) > 2):
+                                log.info(f"Post-submit URL [{submit_wait}s]: {url}")
+                                log.info("Submission confirmed — on response page")
+                                search_url_found = True
+                                # Reconnect bridge to this search tab
+                                await bridge.disconnect()
+                                await bridge.connect()
+                                await asyncio.sleep(1)
+                                break
+                    if search_url_found:
                         break
+                    # Also try direct JS evaluation as a fast path (may work if
+                    # navigation is instant and context is already available)
+                    try:
+                        await bridge._send_cdp("Runtime.enable")
+                        current_url = await asyncio.wait_for(
+                            bridge._evaluate("window.location.href"),
+                            timeout=3,
+                        )
+                        if current_url and ("/search/" in current_url or "/thread/" in current_url):
+                            log.info(f"Post-submit URL [{submit_wait}s]: {current_url}")
+                            log.info("Submission confirmed — on response page (JS)")
+                            search_url_found = True
+                            await asyncio.sleep(1)
+                            break
+                    except Exception:
+                        pass  # Expected during navigation — HTTP poll handles it
                 except Exception as e:
-                    log.warning(f"Post-submit check error: {e}")
+                    log.warning(f"Post-submit check error [{submit_wait}s]: {e}")
                     continue
+
+            if not search_url_found:
+                log.warning("Never saw /search/ URL — trying to proceed anyway")
+                # Try to reconnect to whatever Perplexity tab exists
+                try:
+                    await bridge.disconnect()
+                    await bridge.connect()
+                except Exception as e:
+                    log.error(f"Reconnect failed: {e}")
+
+            # Ensure bridge is connected before polling
+            try:
+                await bridge.ensure_connected()
+            except Exception as e:
+                log.error(f"Bridge not connected for polling: {e}")
+                full_text = "Lost connection to Computer, man."
+                yield sse({"type": "text", "chunk": full_text})
+                yield sse({"type": "done"})
+                return
 
             # Poll for response, yielding status updates via SSE
             elapsed = 0.0
             poll_interval = 2.0
-            timeout = 300.0
+            timeout = 120.0
             idle_count = 0
             ever_saw_working = False
+            consecutive_errors = 0
 
             while elapsed < timeout:
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
 
                 try:
-                    status = await bridge._evaluate(JS_GET_STATUS)
+                    status = await asyncio.wait_for(
+                        bridge._evaluate(JS_GET_STATUS),
+                        timeout=8,
+                    )
+                    consecutive_errors = 0
                 except Exception as e:
-                    log.warning(f"Status poll error: {e}")
+                    consecutive_errors += 1
+                    log.warning(f"Status poll error [{elapsed:.0f}s] (#{consecutive_errors}): {e}")
+                    if consecutive_errors >= 3:
+                        log.info("Too many poll errors, reconnecting bridge...")
+                        try:
+                            await bridge.disconnect()
+                            await bridge.connect()
+                            consecutive_errors = 0
+                        except Exception as re_err:
+                            log.error(f"Reconnect failed: {re_err}")
                     continue
 
                 state = status.get("status", "idle") if isinstance(status, dict) else "idle"
