@@ -525,7 +525,7 @@ class CometBridge:
 
     async def _poll_for_response(
         self,
-        poll_interval: float = 1.5,
+        poll_interval: float = 2.0,
         timeout: float = 300,
         on_status=None,
     ) -> str:
@@ -538,6 +538,7 @@ class CometBridge:
         """
         elapsed = 0.0
         idle_after_submit = 0
+        ever_saw_working = False
 
         while elapsed < timeout:
             await asyncio.sleep(poll_interval)
@@ -553,8 +554,13 @@ class CometBridge:
                 await on_status(status)
 
             state = status.get("status", "idle")
+            log.debug(f"Poll [{elapsed:.0f}s]: state={state}")
 
-            if state == "completed":
+            if state == "working":
+                idle_after_submit = 0
+                ever_saw_working = True
+
+            elif state == "completed":
                 # Extract and return the response
                 response = await self._evaluate(JS_EXTRACT_RESPONSE)
                 if response and len(response.strip()) > 5:
@@ -567,15 +573,17 @@ class CometBridge:
                     return response.strip()
                 return "(Computer finished but returned no text)"
 
-            if state == "idle":
+            elif state == "idle":
                 idle_after_submit += 1
-                # Give it a few polls to start working
-                if idle_after_submit > 4:
+                # Be patient after submission — Perplexity takes several seconds
+                # to start showing working indicators after page navigation.
+                idle_patience = 10 if ever_saw_working else 30
+                if idle_after_submit > 5:
                     # Check if there's prose content anyway (quick response)
                     response = await self._evaluate(JS_EXTRACT_RESPONSE)
                     if response and len(response.strip()) > 5:
                         return response.strip()
-                    if idle_after_submit > 8:
+                    if idle_after_submit > idle_patience:
                         return "(Computer didn't respond. Try again, man.)"
 
         return "(Timed out waiting for Computer, man. That's a bummer.)"

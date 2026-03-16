@@ -151,9 +151,10 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
 
         # Poll for response, yielding status updates via SSE
         elapsed = 0.0
-        poll_interval = 1.5
+        poll_interval = 2.0
         timeout = 300.0
         idle_count = 0
+        ever_saw_working = False
         full_text = ""
 
         while elapsed < timeout:
@@ -168,10 +169,12 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
 
             state = status.get("status", "idle")
             step = status.get("currentStep", "")
+            log.info(f"Poll [{elapsed:.0f}s]: state={state} step={step}")
 
             # Send periodic status updates
             if state == "working":
                 idle_count = 0
+                ever_saw_working = True
                 if step and step != last_step:
                     last_step = step
                     yield sse({"type": "status", "message": f"{step}..."})
@@ -195,12 +198,17 @@ async def stream_response(user_message: str, prefix_events: Optional[List[str]] 
 
             elif state == "idle":
                 idle_count += 1
-                if idle_count > 4:
+                # After submission, Perplexity takes several seconds to start
+                # showing working indicators (especially after page navigation).
+                # Be patient: wait up to 60s (30 polls) before giving up.
+                # If we already saw "working", use a shorter threshold.
+                idle_patience = 10 if ever_saw_working else 30
+                if idle_count > 5:
                     response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
                     if response and len(response.strip()) > 5:
                         full_text = response.strip()
                         break
-                    if idle_count > 8:
+                    if idle_count > idle_patience:
                         full_text = "(Computer didn't respond. Try again, man.)"
                         break
 
