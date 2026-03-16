@@ -8,6 +8,7 @@ needed — The Dude is just a voice/visual frontend for Computer.
 import asyncio
 import json
 import logging
+from typing import Optional, Union
 
 import aiohttp
 import websockets
@@ -232,14 +233,14 @@ class CometBridge:
         self._msg_id += 1
         return self._msg_id
 
-    async def _http_get(self, path: str) -> dict | list:
+    async def _http_get(self, path: str) -> Union[dict, list]:
         """HTTP GET to CDP endpoint."""
         url = f"http://localhost:{self.port}{path}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 return await resp.json()
 
-    async def _send_cdp(self, method: str, params: dict | None = None) -> dict:
+    async def _send_cdp(self, method: str, params: Optional[dict] = None) -> dict:
         """Send a CDP JSON-RPC message and wait for its response."""
         if not self.ws:
             raise ConnectionError("Not connected to Comet. Call connect() first.")
