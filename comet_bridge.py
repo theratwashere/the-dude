@@ -319,7 +319,7 @@ class CometBridge:
 
         # Enable required CDP domains
         await self._send_cdp("Runtime.enable")
-        await self._send_cdp("Input.enable", {})
+        # Note: Input domain doesn't need explicit enable in most CDP implementations
 
         tab_url = target.get("url", "unknown")
         log.info(f"Connected to Comet tab: {tab_url}")
