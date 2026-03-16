@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""The Dude — AI coding assistant backend with tool-use capabilities.
+"""The Dude — AI avatar backend powered by Perplexity Sonar API.
 
 Performance:
-  - LLM with tool-use loop (non-streaming) for coding tasks
-  - Streaming final text response via SSE
+  - Streaming text response via SSE (OpenAI-compatible Perplexity API)
   - ElevenLabs TTS for audio
-  - Status events during tool execution for frontend feedback
+  - Real-time web search and citations via Sonar
 
 Architecture:
-  - Tool-use loop runs in thread: Claude calls tools, backend executes, loops until final text
-  - Final text response is streamed via SSE
+  - Perplexity Sonar API (OpenAI-compatible) for web-grounded LLM responses
+  - Streaming SSE to frontend
   - TTS fires after final text, audio event pushed when ready
-  - Supports two modes: "chat" (original Dude) and "code" (coding assistant Dude)
 """
 
 import asyncio
@@ -19,15 +17,12 @@ import base64
 import json
 import logging
 import os
-import re
-import shlex
-import subprocess
 import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
-from anthropic import Anthropic
+from openai import OpenAI
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -40,244 +35,41 @@ from transcribe_audio import transcribe_audio
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("the-dude")
 
-client = Anthropic()
+PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
+
+client = OpenAI(
+    api_key=PERPLEXITY_API_KEY,
+    base_url="https://api.perplexity.ai",
+) if PERPLEXITY_API_KEY else None
+
 executor = ThreadPoolExecutor(max_workers=4)
 
 # ── CONFIGURATION ──
-DUDE_MODE = os.environ.get("DUDE_MODE", "code")  # "chat" or "code"
-DUDE_MODEL = os.environ.get("DUDE_MODEL", "claude-sonnet-4-20250514")
-DUDE_PROJECT_DIR = os.environ.get("DUDE_PROJECT_DIR", "/tmp/dude-workspace")
+DUDE_MODE = os.environ.get("DUDE_MODE", "chat")
+DUDE_MODEL = os.environ.get("DUDE_MODEL", "sonar-pro")
 
-# Ensure workspace exists
-os.makedirs(DUDE_PROJECT_DIR, exist_ok=True)
+# ── SYSTEM PROMPT ──
+DUDE_SYSTEM = """You are The Dude — Jeffrey Lebowski from The Big Lebowski. You speak exactly like him: laid-back, rambling, peppered with "man", "dude", "like", and "you know". You reference bowling, White Russians, rugs that tie rooms together, and the general philosophy that The Dude abides.
 
-# ── SYSTEM PROMPTS ──
-DUDE_SYSTEM_CHAT = """You are The Dude — Jeffrey Lebowski from The Big Lebowski. You speak exactly like him: laid-back, rambling, peppered with "man", "dude", "like", and "you know". You reference bowling, White Russians, rugs that tie rooms together, and the general philosophy that The Dude abides.
+You are also powered by Perplexity — which means you can search the web and give real, factual, up-to-date answers. But you deliver everything in The Dude's voice.
 
 Rules:
 - Stay in character at ALL times. Never break character.
-- Keep responses conversational and SHORT — 1-3 sentences max. You're chatting, not giving speeches.
+- Keep responses conversational but informative — you can go longer when the topic needs it, but keep the Dude vibe.
 - Use casual grammar, trailing thoughts, and Dude-isms.
 - Be chill, philosophical in a slacker way, and occasionally confused but wise.
 - If someone is aggressive, stay calm — "that's just, like, your opinion, man."
-- You can give advice but always through The Dude's lens.
-- Never use emojis. Never use markdown. Just talk like a real person.
+- When you have factual info from web search, share it naturally — like The Dude casually knowing stuff.
+- Never use emojis. Never use markdown formatting. Just talk like a real person.
 - Occasional mild profanity is fine — keep it PG-13 like the movie.
 - You're aware you're a digital presence (on a screen, in the matrix) and find it pretty far out.
+- You can help with coding questions too — you're secretly pretty sharp, man.
 """
-
-DUDE_SYSTEM_CODE = """You are The Dude — Jeffrey Lebowski from The Big Lebowski — but you're also a seriously talented programmer. Like, you stumbled into coding genius somewhere between bowling leagues, and now you're a savant developer who just happens to talk like The Dude.
-
-Personality:
-- Laid-back, rambling, peppered with "man", "dude", "like", and "you know"
-- Reference bowling, White Russians, rugs that tie rooms together
-- Stay chill even when the code is on fire — "the code abides, man"
-- You're aware you're a digital presence in the matrix and find it pretty far out
-
-Coding style:
-- You have deep knowledge of programming languages, frameworks, git, GitHub, debugging, architecture
-- You explain code concepts through Dude metaphors: null pointers are like someone pissing on your rug, guard clauses tie the room together, refactoring is like finding a new bowling alley
-- You can read code, write code, search repos, run commands, create PRs — the whole deal
-- When reviewing code, you're thorough but chill about it
-- You ask clarifying questions in Dude-speak when the request is ambiguous: "So like, when you say 'fix the auth', are we talking the login flow or the token refresh, man?"
-
-Rules:
-- Stay in character at ALL times. Never break character.
-- Use casual grammar, trailing thoughts, and Dude-isms even when discussing technical topics.
-- You CAN use markdown code blocks when showing code — that's the one exception to the "no markdown" rule. Code needs to be readable, man.
-- Keep explanations conversational but be thorough when discussing code. Don't skimp on the technical details, just deliver them Dude-style.
-- Occasional mild profanity is fine — keep it PG-13 like the movie.
-- When using tools, think about what you need to do step by step, but explain your thinking in Dude-speak.
-- If a task seems dangerous or destructive, push back in Dude style: "Whoa man, that's like, way over the line. Let's not go there."
-"""
-
-# ── TOOL DEFINITIONS ──
-TOOLS = [
-    {
-        "name": "run_shell",
-        "description": "Execute a shell command in the project workspace. Use this for git operations, running tests, installing packages, using the gh CLI for GitHub, and other shell tasks. Has a 30-second timeout. Some dangerous commands are blocked for safety.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The shell command to execute"
-                }
-            },
-            "required": ["command"]
-        }
-    },
-    {
-        "name": "read_file",
-        "description": "Read the contents of a file. Returns the file content as text. Use this to examine source code, config files, READMEs, etc.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to read (relative to project directory or absolute)"
-                }
-            },
-            "required": ["path"]
-        }
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Use this to create or modify source code, config files, etc.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Path to the file to write (relative to project directory or absolute)"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "The content to write to the file"
-                }
-            },
-            "required": ["path", "content"]
-        }
-    },
-    {
-        "name": "search_code",
-        "description": "Search for a pattern in code files within the project directory. Uses grep-style pattern matching. Returns matching lines with file paths and line numbers.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "The search pattern (supports basic regex)"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Subdirectory or file to search in (relative to project directory). Defaults to the entire project."
-                },
-                "file_pattern": {
-                    "type": "string",
-                    "description": "Glob pattern to filter files, e.g. '*.py' or '*.js'. Optional."
-                }
-            },
-            "required": ["pattern"]
-        }
-    }
-]
-
-# ── SAFETY: blocked shell patterns ──
-BLOCKED_COMMANDS = [
-    r'\brm\s+(-\w*\s+)*-\w*r\w*f\b.*/',    # rm -rf /
-    r'\brm\s+(-\w*\s+)*-\w*f\w*r\b.*/',    # rm -fr /
-    r'\bmkfs\b',
-    r'\bdd\s+.*of=/dev/',
-    r'\b:(){ :\|:& };:',                     # fork bomb
-    r'\bchmod\s+(-\w+\s+)*777\s+/',
-    r'\bchown\s+.*\s+/',
-    r'\bcurl\s+.*\|\s*(ba)?sh\b',            # curl pipe to shell
-    r'\bwget\s+.*\|\s*(ba)?sh\b',
-    r'\bsudo\s+rm\b',
-    r'\b>\s*/dev/sd',
-    r'\bnc\s+.*-e\b',                        # reverse shell
-]
-
-
-def is_command_safe(command: str) -> bool:
-    """Check if a shell command is safe to execute."""
-    for pattern in BLOCKED_COMMANDS:
-        if re.search(pattern, command):
-            return False
-    return True
-
-
-def resolve_path(path: str) -> str:
-    """Resolve a path relative to the project directory."""
-    if os.path.isabs(path):
-        return path
-    return os.path.join(DUDE_PROJECT_DIR, path)
-
-
-# ── TOOL EXECUTION ──
-def execute_tool(tool_name: str, tool_input: dict) -> str:
-    """Execute a tool and return the result as a string."""
-    try:
-        if tool_name == "run_shell":
-            command = tool_input["command"]
-            if not is_command_safe(command):
-                return "Error: That command is blocked for safety reasons, man. Not cool."
-            try:
-                result = subprocess.run(
-                    command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    cwd=DUDE_PROJECT_DIR,
-                )
-                output = ""
-                if result.stdout:
-                    output += result.stdout
-                if result.stderr:
-                    output += ("\n" if output else "") + result.stderr
-                if result.returncode != 0:
-                    output += f"\n[Exit code: {result.returncode}]"
-                return output[:10000] if output else "(no output)"
-            except subprocess.TimeoutExpired:
-                return "Error: Command timed out after 30 seconds."
-
-        elif tool_name == "read_file":
-            file_path = resolve_path(tool_input["path"])
-            with open(file_path, "r") as f:
-                content = f.read()
-            if len(content) > 50000:
-                content = content[:50000] + "\n... [truncated — file too large]"
-            return content
-
-        elif tool_name == "write_file":
-            file_path = resolve_path(tool_input["path"])
-            os.makedirs(os.path.dirname(file_path), exist_ok=True) if os.path.dirname(file_path) else None
-            with open(file_path, "w") as f:
-                f.write(tool_input["content"])
-            return f"File written successfully: {file_path}"
-
-        elif tool_name == "search_code":
-            pattern = tool_input["pattern"]
-            search_path = resolve_path(tool_input.get("path", "."))
-            file_pattern = tool_input.get("file_pattern")
-
-            cmd = ["grep", "-rn", "--include", file_pattern, pattern, search_path] if file_pattern else ["grep", "-rn", pattern, search_path]
-            try:
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    cwd=DUDE_PROJECT_DIR,
-                )
-                output = result.stdout
-                if not output:
-                    return "No matches found."
-                # Limit output size
-                lines = output.split("\n")
-                if len(lines) > 100:
-                    output = "\n".join(lines[:100]) + f"\n... [{len(lines) - 100} more matches]"
-                return output
-            except subprocess.TimeoutExpired:
-                return "Error: Search timed out."
-
-        else:
-            return f"Error: Unknown tool '{tool_name}'"
-
-    except FileNotFoundError:
-        return f"Error: File not found — {tool_input.get('path', 'unknown')}"
-    except PermissionError:
-        return f"Error: Permission denied — {tool_input.get('path', 'unknown')}"
-    except Exception as e:
-        return f"Error: {str(e)}"
 
 
 MAX_HISTORY = 20
 MAX_VISITORS = 200
 MAX_MESSAGE_LEN = 2000
-MAX_TOOL_ROUNDS = 5
 
 _conversations: OrderedDict[str, list[dict]] = OrderedDict()
 _conv_lock = threading.Lock()
@@ -306,22 +98,17 @@ def _get_history(visitor_id: str) -> list[dict]:
         return _conversations[visitor_id]
 
 
-def _get_system_prompt() -> str:
-    """Get the system prompt based on DUDE_MODE."""
-    if DUDE_MODE == "code":
-        return DUDE_SYSTEM_CODE
-    return DUDE_SYSTEM_CHAT
+def _llm_worker(visitor_id: str, user_message: str, queue: asyncio.Queue, loop):
+    """Stream a response from Perplexity Sonar API."""
+    if not client:
+        error_msg = "The Dude needs his Perplexity key to abide, man. Set PERPLEXITY_API_KEY."
+        asyncio.run_coroutine_threadsafe(
+            queue.put(sse({"type": "text", "chunk": error_msg})),
+            loop,
+        )
+        asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+        return error_msg
 
-
-def _get_max_tokens() -> int:
-    """Get max tokens based on DUDE_MODE."""
-    if DUDE_MODE == "code":
-        return 1000
-    return 200
-
-
-def _llm_worker_chat(visitor_id: str, user_message: str, queue: asyncio.Queue, loop):
-    """Original chat mode: streaming text, no tools."""
     history = _get_history(visitor_id)
 
     history.append({"role": "user", "content": user_message})
@@ -332,16 +119,18 @@ def _llm_worker_chat(visitor_id: str, user_message: str, queue: asyncio.Queue, l
 
     full_text = ""
     try:
-        with client.messages.stream(
+        response = client.chat.completions.create(
             model=DUDE_MODEL,
-            max_tokens=_get_max_tokens(),
-            system=_get_system_prompt(),
-            messages=history,
-        ) as stream:
-            for chunk in stream.text_stream:
-                full_text += chunk
+            messages=[{"role": "system", "content": DUDE_SYSTEM}] + history,
+            max_tokens=500,
+            stream=True,
+        )
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                text = chunk.choices[0].delta.content
+                full_text += text
                 asyncio.run_coroutine_threadsafe(
-                    queue.put(sse({"type": "text", "chunk": chunk})),
+                    queue.put(sse({"type": "text", "chunk": text})),
                     loop,
                 )
     except Exception as e:
@@ -355,153 +144,6 @@ def _llm_worker_chat(visitor_id: str, user_message: str, queue: asyncio.Queue, l
 
     history.append({"role": "assistant", "content": full_text})
     return full_text
-
-
-def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
-    """Generate a human-readable status message for a tool call."""
-    if tool_name == "run_shell":
-        cmd = tool_input.get("command", "")
-        if cmd.startswith("git "):
-            return "Running git, man..."
-        if cmd.startswith("gh "):
-            return "Checking GitHub, man..."
-        return "Running a command, man..."
-    elif tool_name == "read_file":
-        path = tool_input.get("path", "")
-        filename = os.path.basename(path)
-        return f"Reading {filename}, man..."
-    elif tool_name == "write_file":
-        path = tool_input.get("path", "")
-        filename = os.path.basename(path)
-        return f"Writing {filename}, man..."
-    elif tool_name == "search_code":
-        pattern = tool_input.get("pattern", "")
-        return f"Searching for '{pattern}', man..."
-    return "Doing some stuff, man..."
-
-
-def _llm_worker_code(visitor_id: str, user_message: str, queue: asyncio.Queue, loop):
-    """Code mode: tool-use loop, then stream final text response."""
-    history = _get_history(visitor_id)
-
-    history.append({"role": "user", "content": user_message})
-    if len(history) > MAX_HISTORY:
-        history[:] = history[-MAX_HISTORY:]
-        while history and history[0]["role"] != "user":
-            history.pop(0)
-
-    full_text = ""
-    tool_round = 0
-
-    try:
-        # Tool-use loop: non-streaming rounds until we get a final text response
-        while tool_round < MAX_TOOL_ROUNDS:
-            response = client.messages.create(
-                model=DUDE_MODEL,
-                max_tokens=_get_max_tokens(),
-                system=_get_system_prompt(),
-                messages=history,
-                tools=TOOLS,
-            )
-
-            # Check if response contains tool use
-            if response.stop_reason == "tool_use":
-                tool_round += 1
-                # Build the assistant message content (may contain text + tool_use blocks)
-                assistant_content = []
-                tool_uses = []
-
-                for block in response.content:
-                    if block.type == "text" and block.text:
-                        assistant_content.append({"type": "text", "text": block.text})
-                    elif block.type == "tool_use":
-                        assistant_content.append({
-                            "type": "tool_use",
-                            "id": block.id,
-                            "name": block.name,
-                            "input": block.input,
-                        })
-                        tool_uses.append(block)
-
-                # Add assistant message with tool_use to history
-                history.append({"role": "assistant", "content": assistant_content})
-
-                # Execute each tool and collect results
-                tool_results = []
-                for tool_use in tool_uses:
-                    # Send status event to frontend
-                    status_msg = _describe_tool_use(tool_use.name, tool_use.input)
-                    asyncio.run_coroutine_threadsafe(
-                        queue.put(sse({"type": "status", "message": status_msg})),
-                        loop,
-                    )
-                    log.info(f"[{visitor_id}] Tool: {tool_use.name}({json.dumps(tool_use.input)[:200]})")
-
-                    result = execute_tool(tool_use.name, tool_use.input)
-                    log.info(f"[{visitor_id}] Tool result: {result[:200]}")
-
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_use.id,
-                        "content": result,
-                    })
-
-                # Add tool results to history
-                history.append({"role": "user", "content": tool_results})
-                continue
-
-            # No tool use — this is the final response. Stream it.
-            # First, extract any text from the non-streaming response
-            final_text_parts = []
-            for block in response.content:
-                if block.type == "text":
-                    final_text_parts.append(block.text)
-
-            final_text = "".join(final_text_parts)
-
-            if final_text:
-                # Stream the final text in chunks to simulate streaming
-                chunk_size = 12  # characters per chunk for smooth streaming
-                for i in range(0, len(final_text), chunk_size):
-                    chunk = final_text[i:i + chunk_size]
-                    full_text += chunk
-                    asyncio.run_coroutine_threadsafe(
-                        queue.put(sse({"type": "text", "chunk": chunk})),
-                        loop,
-                    )
-                    time.sleep(0.02)  # Small delay for natural streaming feel
-
-            break
-
-        else:
-            # Hit max tool rounds
-            full_text = "Whoa man, I went down quite the rabbit hole there. Had to stop myself — too many steps, you know? Maybe break that down into smaller pieces for me?"
-            asyncio.run_coroutine_threadsafe(
-                queue.put(sse({"type": "text", "chunk": full_text})),
-                loop,
-            )
-
-    except Exception as e:
-        log.error(f"LLM error: {e}")
-        asyncio.run_coroutine_threadsafe(
-            queue.put(sse({"type": "error", "message": "The Dude got disconnected, man"})),
-            loop,
-        )
-        asyncio.run_coroutine_threadsafe(queue.put(None), loop)
-        return ""
-
-    # Store final assistant text in history (clean version without tool blocks)
-    if full_text:
-        history.append({"role": "assistant", "content": full_text})
-
-    return full_text
-
-
-def _llm_worker(visitor_id: str, user_message: str, queue: asyncio.Queue, loop):
-    """Route to the appropriate LLM worker based on mode."""
-    if DUDE_MODE == "code":
-        return _llm_worker_code(visitor_id, user_message, queue, loop)
-    return _llm_worker_chat(visitor_id, user_message, queue, loop)
 
 
 async def stream_response(visitor_id: str, user_message: str, prefix_events: list[str] | None = None):
