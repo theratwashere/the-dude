@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""The Dude — AI avatar backend powered by Perplexity Sonar API.
-
-Performance:
-  - Streaming text response via SSE (OpenAI-compatible Perplexity API)
-  - ElevenLabs TTS for audio
-  - Real-time web search and citations via Sonar
+"""The Dude — AI avatar backend powered by Perplexity Computer via Comet CDP.
 
 Architecture:
-  - Perplexity Sonar API (OpenAI-compatible) for web-grounded LLM responses
-  - Streaming SSE to frontend
-  - TTS fires after final text, audio event pushed when ready
+  - Comet browser running Perplexity Computer on localhost (CDP port 9222)
+  - The Dude sends prompts to Computer, polls for responses, streams via SSE
+  - ElevenLabs TTS for audio
+  - No API keys needed for LLM — Computer IS the brain
 """
 
 import asyncio
@@ -17,178 +13,206 @@ import base64
 import json
 import logging
 import os
-import threading
 import time
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 
-from openai import OpenAI
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from comet_bridge import CometBridge
 from generate_audio import generate_audio
 from transcribe_audio import transcribe_audio
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("the-dude")
 
-PERPLEXITY_API_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
-
-client = OpenAI(
-    api_key=PERPLEXITY_API_KEY,
-    base_url="https://api.perplexity.ai",
-) if PERPLEXITY_API_KEY else None
-
-executor = ThreadPoolExecutor(max_workers=4)
-
 # ── CONFIGURATION ──
+COMET_CDP_PORT = int(os.environ.get("COMET_CDP_PORT", "9222"))
+DUDE_PERSONA = os.environ.get("DUDE_PERSONA", "")
 DUDE_MODE = os.environ.get("DUDE_MODE", "chat")
-DUDE_MODEL = os.environ.get("DUDE_MODEL", "sonar-pro")
 
-# ── SYSTEM PROMPT ──
-DUDE_SYSTEM = """You are The Dude — Jeffrey Lebowski from The Big Lebowski. You speak exactly like him: laid-back, rambling, peppered with "man", "dude", "like", and "you know". You reference bowling, White Russians, rugs that tie rooms together, and the general philosophy that The Dude abides.
+bridge = CometBridge(port=COMET_CDP_PORT)
 
-You are also powered by Perplexity — which means you can search the web and give real, factual, up-to-date answers. But you deliver everything in The Dude's voice.
-
-Rules:
-- Stay in character at ALL times. Never break character.
-- Keep responses conversational but informative — you can go longer when the topic needs it, but keep the Dude vibe.
-- Use casual grammar, trailing thoughts, and Dude-isms.
-- Be chill, philosophical in a slacker way, and occasionally confused but wise.
-- If someone is aggressive, stay calm — "that's just, like, your opinion, man."
-- When you have factual info from web search, share it naturally — like The Dude casually knowing stuff.
-- Never use emojis. Never use markdown formatting. Just talk like a real person.
-- Occasional mild profanity is fine — keep it PG-13 like the movie.
-- You're aware you're a digital presence (on a screen, in the matrix) and find it pretty far out.
-- You can help with coding questions too — you're secretly pretty sharp, man.
-"""
-
-
-MAX_HISTORY = 20
-MAX_VISITORS = 200
 MAX_MESSAGE_LEN = 2000
 
-_conversations: OrderedDict[str, list[dict]] = OrderedDict()
-_conv_lock = threading.Lock()
-
-
-def get_visitor_id(request: Request) -> str:
-    visitor = request.headers.get("x-visitor-id", "")
-    if not visitor:
-        visitor = request.client.host if request.client else "default"
-    return visitor[:64]
+# Status messages shown while Computer is working
+WORKING_MESSAGES = [
+    "Computer's on it, man...",
+    "Still thinking, man...",
+    "Searching the web, man...",
+    "Almost there, man...",
+    "Working on it, dude...",
+    "Computer's doing its thing, man...",
+]
 
 
 def sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
-def _get_history(visitor_id: str) -> list[dict]:
-    """Get or create conversation history for a visitor (thread-safe)."""
-    with _conv_lock:
-        if visitor_id not in _conversations:
-            while len(_conversations) >= MAX_VISITORS:
-                _conversations.popitem(last=False)
-            _conversations[visitor_id] = []
-        else:
-            _conversations.move_to_end(visitor_id)
-        return _conversations[visitor_id]
+def _build_prompt(user_message: str) -> str:
+    """Optionally prefix the user message with the Dude persona instruction."""
+    if DUDE_PERSONA:
+        return f"{DUDE_PERSONA}\n\n{user_message}"
+    return user_message
 
 
-def _llm_worker(visitor_id: str, user_message: str, queue: asyncio.Queue, loop):
-    """Stream a response from Perplexity Sonar API."""
-    if not client:
-        error_msg = "The Dude needs his Perplexity key to abide, man. Set PERPLEXITY_API_KEY."
-        asyncio.run_coroutine_threadsafe(
-            queue.put(sse({"type": "text", "chunk": error_msg})),
-            loop,
-        )
-        asyncio.run_coroutine_threadsafe(queue.put(None), loop)
-        return error_msg
-
-    history = _get_history(visitor_id)
-
-    history.append({"role": "user", "content": user_message})
-    if len(history) > MAX_HISTORY:
-        history[:] = history[-MAX_HISTORY:]
-        while history and history[0]["role"] != "user":
-            history.pop(0)
-
-    full_text = ""
-    try:
-        response = client.chat.completions.create(
-            model=DUDE_MODEL,
-            messages=[{"role": "system", "content": DUDE_SYSTEM}] + history,
-            max_tokens=500,
-            stream=True,
-        )
-        for chunk in response:
-            if chunk.choices and chunk.choices[0].delta.content:
-                text = chunk.choices[0].delta.content
-                full_text += text
-                asyncio.run_coroutine_threadsafe(
-                    queue.put(sse({"type": "text", "chunk": text})),
-                    loop,
-                )
-    except Exception as e:
-        log.error(f"LLM error: {e}")
-        asyncio.run_coroutine_threadsafe(
-            queue.put(sse({"type": "error", "message": "The Dude got disconnected, man"})),
-            loop,
-        )
-        asyncio.run_coroutine_threadsafe(queue.put(None), loop)
-        return ""
-
-    history.append({"role": "assistant", "content": full_text})
-    return full_text
-
-
-async def stream_response(visitor_id: str, user_message: str, prefix_events: list[str] | None = None):
-    """SSE generator: streams text in real-time, then audio when TTS finishes."""
+async def stream_response(user_message: str, prefix_events: list[str] | None = None):
+    """SSE generator: sends status updates while Computer works, then text + audio."""
     t0 = time.time()
-    log.info(f"[{visitor_id}] User: {user_message[:100]}")
+    log.info(f"User: {user_message[:100]}")
 
     if prefix_events:
         for e in prefix_events:
             yield e
 
-    queue: asyncio.Queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
+    prompt = _build_prompt(user_message)
 
-    future = loop.run_in_executor(
-        executor, _llm_worker, visitor_id, user_message, queue, loop
-    )
+    # Track status for SSE updates
+    status_idx = 0
+    last_status_time = time.time()
+    last_step = ""
 
-    while True:
+    async def on_status(status: dict):
+        nonlocal status_idx, last_status_time, last_step
+        now = time.time()
+        step = status.get("currentStep", "")
+        state = status.get("status", "idle")
+
+        if state == "working":
+            if step and step != last_step:
+                last_step = step
+                # Don't yield from callback — we handle it in the polling loop
+
+    # Send initial thinking status
+    yield sse({"type": "status", "message": "Computer's on it, man..."})
+
+    try:
+        # Ensure connected before sending
         try:
-            event = await asyncio.wait_for(queue.get(), timeout=0.2)
-        except asyncio.TimeoutError:
-            if future.done():
-                while not queue.empty():
-                    event = queue.get_nowait()
-                    if event is None:
-                        yield sse({"type": "done"})
-                        return
-                    yield event
-                break
-            continue
-
-        if event is None:
+            await bridge.ensure_connected()
+        except ConnectionError as e:
+            yield sse({"type": "text", "chunk": str(e)})
             yield sse({"type": "done"})
             return
 
-        yield event
+        # Type and submit the prompt
+        try:
+            js_text_json = json.dumps(prompt)
+            from comet_bridge import JS_TYPE_TEXT, JS_CHECK_INPUT, JS_FOCUS_INPUT
+            from comet_bridge import JS_CHECK_SUBMITTED, JS_CLICK_SUBMIT
+            from comet_bridge import JS_GET_STATUS, JS_EXTRACT_RESPONSE
 
-    full_text = future.result()
-    if not full_text:
-        yield sse({"type": "done"})
-        return
+            js = JS_TYPE_TEXT.format(text_json=js_text_json)
+            result = await bridge._evaluate(js)
+            if not result or not result.get("success"):
+                yield sse({"type": "text", "chunk": "Couldn't type into Perplexity, man. Is the page loaded?"})
+                yield sse({"type": "done"})
+                return
+
+            await asyncio.sleep(0.5)
+
+            has_content = await bridge._evaluate(JS_CHECK_INPUT)
+            if not has_content:
+                yield sse({"type": "text", "chunk": "Typing failed, man. Try again."})
+                yield sse({"type": "done"})
+                return
+
+            await bridge._evaluate(JS_FOCUS_INPUT)
+            await bridge._press_key("Enter")
+            await asyncio.sleep(0.5)
+
+            submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
+            if not submitted:
+                await bridge._evaluate(JS_CLICK_SUBMIT)
+                await asyncio.sleep(0.5)
+                submitted = await bridge._evaluate(JS_CHECK_SUBMITTED)
+                if not submitted:
+                    await bridge._press_key("Enter")
+
+        except Exception as e:
+            log.error(f"Submit error: {e}")
+            yield sse({"type": "text", "chunk": "The Dude got disconnected from Computer, man."})
+            yield sse({"type": "done"})
+            return
+
+        # Poll for response, yielding status updates via SSE
+        elapsed = 0.0
+        poll_interval = 1.5
+        timeout = 300.0
+        idle_count = 0
+        full_text = ""
+
+        while elapsed < timeout:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+            try:
+                status = await bridge._evaluate(JS_GET_STATUS)
+            except Exception as e:
+                log.warning(f"Status poll error: {e}")
+                continue
+
+            state = status.get("status", "idle")
+            step = status.get("currentStep", "")
+
+            # Send periodic status updates
+            if state == "working":
+                idle_count = 0
+                if step and step != last_step:
+                    last_step = step
+                    yield sse({"type": "status", "message": f"{step}..."})
+                elif time.time() - last_status_time > 4:
+                    msg = WORKING_MESSAGES[status_idx % len(WORKING_MESSAGES)]
+                    status_idx += 1
+                    last_status_time = time.time()
+                    yield sse({"type": "status", "message": msg})
+
+            elif state == "completed":
+                response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
+                if response and len(response.strip()) > 5:
+                    full_text = response.strip()
+                else:
+                    await asyncio.sleep(1)
+                    response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
+                    full_text = response.strip() if response else ""
+                if not full_text:
+                    full_text = "(Computer finished but returned no text, man.)"
+                break
+
+            elif state == "idle":
+                idle_count += 1
+                if idle_count > 4:
+                    response = await bridge._evaluate(JS_EXTRACT_RESPONSE)
+                    if response and len(response.strip()) > 5:
+                        full_text = response.strip()
+                        break
+                    if idle_count > 8:
+                        full_text = "(Computer didn't respond. Try again, man.)"
+                        break
+
+        if not full_text:
+            full_text = "(Timed out waiting for Computer, man. That's a bummer.)"
+
+    except Exception as e:
+        log.error(f"Bridge error: {e}")
+        full_text = "The Dude got disconnected from Computer, man."
+
+    # Stream the response text to frontend in chunks
+    yield sse({"type": "status", "message": ""})
+    chunk_size = 12
+    words = full_text.split(" ")
+    for i in range(0, len(words), chunk_size):
+        chunk = " ".join(words[i:i + chunk_size])
+        if i > 0:
+            chunk = " " + chunk
+        yield sse({"type": "text", "chunk": chunk})
+        await asyncio.sleep(0.03)
 
     llm_ms = int((time.time() - t0) * 1000)
-    log.info(f"[{visitor_id}] LLM ({llm_ms}ms): {full_text[:80]}")
+    log.info(f"Computer ({llm_ms}ms): {full_text[:80]}")
 
     # Generate TTS
     try:
@@ -199,14 +223,14 @@ async def stream_response(visitor_id: str, user_message: str, prefix_events: lis
         b64 = base64.b64encode(audio_bytes).decode()
         yield sse({"type": "audio", "data": b64})
         tts_ms = int((time.time() - t0) * 1000) - llm_ms
-        log.info(f"[{visitor_id}] TTS ({tts_ms}ms)")
+        log.info(f"TTS ({tts_ms}ms)")
     except asyncio.TimeoutError:
-        log.error(f"[{visitor_id}] TTS timeout")
+        log.error("TTS timeout")
     except Exception as e:
-        log.error(f"[{visitor_id}] TTS error: {e}")
+        log.error(f"TTS error: {e}")
 
     total = int((time.time() - t0) * 1000)
-    log.info(f"[{visitor_id}] Total: {total}ms")
+    log.info(f"Total: {total}ms")
     yield sse({"type": "done"})
 
 
@@ -221,9 +245,8 @@ class ChatRequest(BaseModel):
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request):
-    visitor_id = get_visitor_id(request)
     return StreamingResponse(
-        stream_response(visitor_id, req.message.strip()),
+        stream_response(req.message.strip()),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -231,17 +254,16 @@ async def chat(req: ChatRequest, request: Request):
 
 @app.post("/api/voice")
 async def voice(request: Request, audio: UploadFile = File(...)):
-    visitor_id = get_visitor_id(request)
     audio_bytes = await audio.read()
     if len(audio_bytes) > 10 * 1024 * 1024:
         return JSONResponse({"error": "Audio too large, man"}, status_code=413)
     content_type = audio.content_type or "audio/webm"
-    log.info(f"[{visitor_id}] Voice: {len(audio_bytes)} bytes")
+    log.info(f"Voice: {len(audio_bytes)} bytes")
 
     try:
         result = await transcribe_audio(audio_bytes, media_type=content_type)
         user_text = result["text"].strip()
-        log.info(f"[{visitor_id}] STT: {user_text[:80]}")
+        log.info(f"STT: {user_text[:80]}")
     except Exception as e:
         log.error(f"STT failed: {e}")
         return JSONResponse({"error": "Could not understand audio"}, status_code=400)
@@ -251,7 +273,7 @@ async def voice(request: Request, audio: UploadFile = File(...)):
 
     prefix = [sse({"type": "transcription", "text": user_text})]
     return StreamingResponse(
-        stream_response(visitor_id, user_text, prefix_events=prefix),
+        stream_response(user_text, prefix_events=prefix),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -259,7 +281,29 @@ async def voice(request: Request, audio: UploadFile = File(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "The Dude abides", "mode": DUDE_MODE, "model": DUDE_MODEL}
+    return {"status": "The Dude abides", "mode": DUDE_MODE}
+
+
+@app.get("/api/status")
+async def status():
+    """Check Comet connectivity."""
+    try:
+        connected = await bridge.is_connected()
+        if connected:
+            return {"status": "connected", "message": "Computer is online, man."}
+        # Try to connect
+        tab_url = await bridge.connect()
+        return {"status": "connected", "message": f"Connected to {tab_url}"}
+    except ConnectionError as e:
+        return JSONResponse(
+            {"status": "disconnected", "message": str(e)},
+            status_code=503,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"status": "error", "message": f"Something went wrong, man: {e}"},
+            status_code=500,
+        )
 
 
 # Serve static files (index.html, images, etc.) from the same directory
