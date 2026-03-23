@@ -432,6 +432,18 @@ async def chat(req: ChatRequest, request: Request):
     )
 
 
+@app.post("/api/client-error")
+async def client_error(request: Request):
+    """Receive JS error reports from the frontend."""
+    try:
+        body = await request.body()
+        data = json.loads(body) if body else {}
+        log.error("CLIENT JS: %s", json.dumps(data)[:500])
+    except Exception:
+        log.error("CLIENT ERROR (unparseable body)")
+    return {"ok": True}
+
+
 @app.get("/api/health")
 async def health():
     return {
@@ -460,6 +472,20 @@ async def status():
             {"status": "error", "message": f"Something went wrong, man: {e}"},
             status_code=500,
         )
+
+
+
+@app.get("/api/livekit-token")
+async def livekit_token():
+    """Proxy to the LiveKit token server on port 8081."""
+    try:
+        import urllib.request, json as _json
+        req = urllib.request.urlopen("http://localhost:8081/api/livekit-token", timeout=5)
+        data = _json.loads(req.read())
+        return data
+    except Exception as e:
+        log.error("LiveKit token proxy error: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=502)
 
 
 # Serve static files (index.html, images, etc.) from the same directory

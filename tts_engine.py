@@ -39,8 +39,11 @@ HAS_TTS = HAS_EDGE_TTS or HAS_MACOS_SAY
 if not HAS_TTS:
     log.warning("No TTS engine available. Install edge-tts: pip3 install edge-tts")
 
-# Default voice for edge-tts — a laid-back male voice
-EDGE_VOICE = os.environ.get("DUDE_VOICE", "en-US-GuyNeural")
+# Default voice for edge-tts — deep gravelly old-west drawl
+EDGE_VOICE = os.environ.get("DUDE_VOICE", "en-US-AndrewMultilingualNeural")
+# Prosody: real slow, pitched way down for that gruff cowboy growl
+EDGE_RATE = os.environ.get("DUDE_RATE", "-20%")
+EDGE_PITCH = os.environ.get("DUDE_PITCH", "-30Hz")
 # macOS voice fallback
 MACOS_VOICE = os.environ.get("DUDE_MACOS_VOICE", "Daniel")
 
@@ -97,7 +100,11 @@ def _clean_for_tts(text: str) -> str:
 
 async def _edge_tts(text: str) -> bytes:
     """Generate audio using edge-tts (returns MP3 bytes)."""
-    communicate = edge_tts.Communicate(text, EDGE_VOICE)
+    communicate = edge_tts.Communicate(
+        text, EDGE_VOICE,
+        rate=EDGE_RATE,
+        pitch=EDGE_PITCH,
+    )
     audio_chunks = []
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":

@@ -20,6 +20,20 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>The Dude</title>
+<!-- LiveKit SDK loaded on-demand when mic button is tapped -->
+<script>
+// Global error catcher — logs JS crashes to server
+window.onerror = function(msg, src, line, col, err) {
+  var payload = JSON.stringify({msg: msg, src: src, line: line, col: col, stack: err && err.stack ? err.stack.substring(0,500) : ''});
+  navigator.sendBeacon('/api/client-error', payload);
+  console.error('JS CRASH:', msg, 'at', src, line, col);
+};
+window.addEventListener('unhandledrejection', function(e) {
+  var payload = JSON.stringify({msg: 'Unhandled rejection: ' + String(e.reason).substring(0,200)});
+  navigator.sendBeacon('/api/client-error', payload);
+  console.error('Unhandled rejection:', e.reason);
+});
+</script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body {
@@ -33,6 +47,7 @@
     position: fixed; top: 0; left: 0;
     width: 100%; height: 100%;
     z-index: 0;
+    image-rendering: auto; /* smooth upscale on mobile half-res */
   }
   #face-layer {
     position: fixed; top: 0; left: 0;
@@ -45,17 +60,32 @@
     object-fit: contain;
     filter: drop-shadow(0 0 30px rgba(0,255,65,0.25)) drop-shadow(0 0 60px rgba(0,255,65,0.1));
   }
+  @media (max-width: 768px) {
+    #face-layer img {
+      height: 60vh; width: auto;
+    }
+  }
   #face-idle { opacity: 1; position: absolute; }
   #face-talk { opacity: 0; position: absolute; pointer-events: none; will-change: opacity, transform; }
+  #face-canvas {
+    position: absolute;
+    z-index: 2;
+    opacity: 0;
+    pointer-events: none;
+    image-rendering: auto;
+    transition: opacity 0.08s ease;
+    filter: drop-shadow(0 0 30px rgba(0,255,65,0.25)) drop-shadow(0 0 60px rgba(0,255,65,0.1));
+  }
 
   /* ── MOUTH SVG OVERLAY ── */
   #mouth-overlay {
     position: fixed; top: 0; left: 0;
     width: 100%; height: 100%;
-    z-index: 1;
+    z-index: 5;
     pointer-events: none;
     display: flex; align-items: center; justify-content: center;
   }
+
   #mouth-svg {
     position: absolute;
     filter: drop-shadow(0 0 6px rgba(0,255,65,0.6)) drop-shadow(0 0 12px rgba(0,255,65,0.3));
@@ -253,15 +283,15 @@
   }
 
   #mic-btn.recording {
-    border-color: #ff3333;
-    background: rgba(60,0,0,0.75);
-    color: #ff3333;
-    box-shadow: 0 0 16px rgba(255,50,50,0.3);
-    animation: pulse-red 1.2s infinite;
+    border-color: #00ff41;
+    background: rgba(0,40,0,0.75);
+    color: #00ff41;
+    box-shadow: 0 0 16px rgba(0,255,65,0.3);
+    animation: pulse-green 1.2s infinite;
   }
-  @keyframes pulse-red {
-    0%, 100% { box-shadow: 0 0 16px rgba(255,50,50,0.3); }
-    50% { box-shadow: 0 0 24px rgba(255,50,50,0.5); }
+  @keyframes pulse-green {
+    0%, 100% { box-shadow: 0 0 16px rgba(0,255,65,0.3); }
+    50% { box-shadow: 0 0 24px rgba(0,255,65,0.5); }
   }
 
   @keyframes blink {
@@ -299,8 +329,9 @@
 
 <canvas id="rain-canvas"></canvas>
 <div id="face-layer">
-  <img id="face-idle" src="dude-idle.png" alt="The Dude">
-  <img id="face-talk" src="dude-talk.png" alt="The Dude talking">
+  <img id="face-idle" src="dude-idle.webp" alt="The Dude">
+  <img id="face-talk" src="dude-talk.webp" alt="The Dude talking">
+  <canvas id="face-canvas"></canvas>
 </div>
 <div id="mouth-overlay">
   <svg id="mouth-svg" viewBox="0 0 120 80" xmlns="http://www.w3.org/2000/svg">
@@ -348,6 +379,9 @@ const VISITOR_ID = (typeof crypto !== 'undefined' && crypto.randomUUID)
   : 'v-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 const COMMON_HEADERS = { 'X-Visitor-Id': VISITOR_ID };
 
+// ── MOBILE DETECTION (early — needed by SVG init and other setup) ──
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || new URLSearchParams(location.search).has('mobile');
+
 // ── DOM ──
 const bgCanvas = document.getElementById('rain-canvas');
 const bgCtx = bgCanvas.getContext('2d');
@@ -380,6 +414,17 @@ let textFadeTimer = null;
 let isCodeMode = false;  // tracks if current response has code
 
 // ── AUDIO CONTEXT ──
+// iOS Safari routes Web Audio (BufferSource) through the ringer channel,
+// which is silent when the mute switch is on. To force audio through the
+// media channel (always audible), we use createMediaStreamDestination():
+//   BufferSource → analyser → mediaStreamDest → hidden <audio> element
+// The <audio> element plays the MediaStream on the media channel.
+// During a user gesture we play a silent looping <audio> to prime the
+// media channel, then swap to the real stream.
+let _mediaStreamDest = null; // MediaStreamAudioDestinationNode
+let _streamAudioEl = null;   // hidden <audio> playing the stream
+let _audioUnlocked = false;
+
 function ensureAudioCtx() {
   if (!audioCtx) {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -387,10 +432,32 @@ function ensureAudioCtx() {
     analyser.fftSize = 256;
     analyser.smoothingTimeConstant = 0.3;
     volumeData = new Uint8Array(analyser.frequencyBinCount);
-    analyser.connect(audioCtx.destination);
+
+    if (isMobile) {
+      // Route through MediaStreamDestination → <audio> for media channel
+      _mediaStreamDest = audioCtx.createMediaStreamDestination();
+      analyser.connect(_mediaStreamDest);
+      _streamAudioEl = document.createElement('audio');
+      _streamAudioEl.setAttribute('playsinline', '');
+      _streamAudioEl.srcObject = _mediaStreamDest.stream;
+      document.body.appendChild(_streamAudioEl);
+    } else {
+      // Desktop: direct to speakers
+      analyser.connect(audioCtx.destination);
+    }
   }
-  if (audioCtx.state === 'suspended') {
+  if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
     audioCtx.resume().catch(() => {});
+  }
+  // On first user gesture, start the hidden <audio> so iOS opens media channel
+  if (isMobile && !_audioUnlocked && _streamAudioEl) {
+    _audioUnlocked = true;
+    _streamAudioEl.play().then(() => {
+      console.log('iOS media-channel audio element started');
+    }).catch(e => {
+      console.warn('iOS stream audio play failed:', e);
+      _audioUnlocked = false;
+    });
   }
 }
 
@@ -490,9 +557,19 @@ function interruptDude() {
   visemeWeights = { A: 1, B: 0, C: 0, D: 0, E: 0, F: 0 };
   visemeTargets = { A: 1, B: 0, C: 0, D: 0, E: 0, F: 0 };
   smoothBands = { sub: 0, low: 0, lowMid: 0, mid: 0, high: 0, veryHigh: 0 };
+  // Reset synthetic mouth state
+  _synthPhase = 0;
+  _synthLastFrame = 0;
+  _analyserWorking = null;
+  _analyserCheckFrames = 0;
+  _analyserSum = 0;
+  _smoothOpen = 0;
+  // Crossfade back to img elements
+  idleImg.style.visibility = 'visible';
+  idleImg.style.opacity = '1';
   talkImg.style.opacity = '0';
   talkImg.style.transform = '';
-  idleImg.style.opacity = '1';
+  faceCanvas.style.opacity = '0';
   clearDudeText();
   setStatus('');
   setBusy(false);
@@ -634,6 +711,13 @@ async function drainAudioQueue() {
   playingAudio = true;
   ensureAudioCtx();
 
+  // Reset synthetic mouth state for new audio session
+  _synthPhase = 0;
+  _synthLastFrame = 0;
+  _analyserWorking = null;
+  _analyserCheckFrames = 0;
+  _analyserSum = 0;
+
   // Safety timeout: if audio hangs for 30s, force recovery
   const safetyTimer = setTimeout(() => {
     console.warn('Audio drain safety timeout — forcing recovery');
@@ -645,12 +729,18 @@ async function drainAudioQueue() {
     setBusy(false);
   }, 30000);
 
+  console.log('drainAudioQueue: processing', audioQueue.length, 'items');
   while (audioQueue.length > 0) {
     const item = audioQueue.shift();
+    console.log('drainAudioQueue: playing chunk, data length:', item.data.length, 'remaining:', audioQueue.length);
     try {
       await playAudioChunk(item.data, item.format);
+      console.log('drainAudioQueue: chunk complete');
     } catch (err) {
       console.error('Playback error:', err);
+      navigator.sendBeacon('/api/client-error', JSON.stringify({
+        msg: 'PLAYBACK_ERROR', error: String(err)
+      }));
     }
   }
 
@@ -664,18 +754,29 @@ async function drainAudioQueue() {
 
 function playAudioChunk(b64data, format) {
   const mimeType = format || 'audio/mp3';
+  const binary = atob(b64data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+  console.log('playAudioChunk: isMobile=' + isMobile + ', bytes=' + bytes.length + ', format=' + mimeType);
+
+  // Mobile path: use Web Audio BufferSource routed through MediaStreamDest
+  // The hidden <audio> element plays the stream on the media channel,
+  // bypassing the iOS mute switch.
+  if (isMobile) {
+    return playViaWebAudioAPI(bytes.buffer.slice(0));
+  }
+
+  // Desktop path: HTML5 Audio with MediaElementSource for analyser
+  const blob = new Blob([bytes], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+
   return new Promise((resolve, reject) => {
     try {
-      const binary = atob(b64data);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const blob = new Blob([bytes], { type: mimeType });
-      const url = URL.createObjectURL(blob);
-
       const audio = new Audio();
-      audio.crossOrigin = 'anonymous';
 
       let source = null;
+      audio.crossOrigin = 'anonymous';
       try {
         source = audioCtx.createMediaElementSource(audio);
         source.connect(analyser);
@@ -688,6 +789,7 @@ function playAudioChunk(b64data, format) {
       isPlaying = true;
 
       audio.onended = () => {
+        console.log('Audio element playback ended');
         URL.revokeObjectURL(url);
         currentAudioEl = null;
         if (source) {
@@ -705,7 +807,9 @@ function playAudioChunk(b64data, format) {
       };
 
       audio.src = url;
-      audio.play().catch(err => {
+      audio.play().then(() => {
+        console.log('Audio.play() OK');
+      }).catch(err => {
         console.warn('Audio.play() rejected, trying Web Audio fallback:', err);
         URL.revokeObjectURL(url);
         currentAudioEl = null;
@@ -720,18 +824,45 @@ function playAudioChunk(b64data, format) {
 
 function playViaWebAudioAPI(arrayBuffer) {
   return new Promise((resolve, reject) => {
+    console.log('playViaWebAudioAPI: decoding', arrayBuffer.byteLength, 'bytes, ctx state:', audioCtx.state);
+    if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
+      audioCtx.resume().then(() => {
+        console.log('AudioContext resumed successfully');
+      }).catch(e => console.warn('AudioContext resume failed:', e));
+    }
+    // Ensure the stream <audio> element is playing (may have been paused/interrupted)
+    if (_streamAudioEl && _streamAudioEl.paused) {
+      _streamAudioEl.play().catch(e => console.warn('Stream audio re-play failed:', e));
+    }
     audioCtx.decodeAudioData(arrayBuffer).then(audioBuffer => {
+      console.log('Decoded audio buffer:', audioBuffer.duration.toFixed(2), 'sec,', audioBuffer.numberOfChannels, 'ch,', audioBuffer.sampleRate, 'Hz');
       const source = audioCtx.createBufferSource();
       source.buffer = audioBuffer;
+      // Connect to analyser; on mobile, analyser feeds MediaStreamDest -> <audio>
       source.connect(analyser);
       isPlaying = true;
 
       source.onended = () => {
+        console.log('BufferSource playback ended');
         resolve();
       };
       source.start(0);
+      console.log('BufferSource started, ctx state:', audioCtx.state,
+        'streamEl paused:', _streamAudioEl ? _streamAudioEl.paused : 'N/A');
+      navigator.sendBeacon('/api/client-error', JSON.stringify({
+        msg: 'AUDIO_PLAY_VIA_STREAM',
+        ctxState: audioCtx.state,
+        duration: audioBuffer.duration,
+        sampleRate: audioBuffer.sampleRate,
+        channels: audioBuffer.numberOfChannels,
+        streamElPaused: _streamAudioEl ? _streamAudioEl.paused : null,
+        isMobile: isMobile
+      }));
     }).catch(err => {
       console.error('Web Audio decode failed:', err);
+      navigator.sendBeacon('/api/client-error', JSON.stringify({
+        msg: 'AUDIO_DECODE_FAILED', error: String(err)
+      }));
       reject(err);
     });
   });
@@ -761,6 +892,40 @@ let nextBlinkTime = performance.now() + 2000 + Math.random() * 4000;
 let blinkActive = false;
 let blinkStartTime = 0;
 const BLINK_DURATION = 150; // ms
+
+// ── SYNTHETIC MOUTH FALLBACK ──
+// When iOS Safari analyser returns zeros despite audio playing,
+// generate speech-like mouth movement from timing alone
+let _synthPhase = 0;
+let _synthLastFrame = 0;
+let _analyserWorking = null; // null=unknown, true/false after first check
+let _analyserCheckFrames = 0;
+let _analyserSum = 0;
+
+function getSyntheticMouth(now) {
+  // Generate speech-like mouth openness + width using layered sine waves
+  const dt = (_synthLastFrame > 0) ? (now - _synthLastFrame) / 1000 : 0.016;
+  _synthLastFrame = now;
+  _synthPhase += dt;
+  const t = _synthPhase;
+
+  // Syllable rhythm: ~5Hz open/close
+  const syllable = Math.sin(t * 5.2 * Math.PI * 2) * 0.5 + 0.5;
+  // Word stress: ~1.5Hz amplitude modulation
+  const wordEnv = Math.sin(t * 1.4 * Math.PI * 2) * 0.3 + 0.7;
+  // Sentence breathing: ~0.3Hz pauses
+  const sentEnv = Math.max(0, Math.sin(t * 0.35 * Math.PI * 2) * 0.4 + 0.6);
+  // Jitter for natural feel
+  const jitter = Math.sin(t * 13.7) * 0.12 + Math.sin(t * 7.3) * 0.08;
+
+  const openness = Math.max(0, Math.min(1, syllable * wordEnv * sentEnv + jitter));
+
+  // Width varies independently: narrow for O/U, wide for AH/EE
+  const widthCycle = Math.sin(t * 3.1 * Math.PI * 2) * 0.3 + 0.5;
+  const width = Math.max(0.2, Math.min(0.9, widthCycle + Math.sin(t * 1.7) * 0.2));
+
+  return { openness, width, amplitude: openness * 60 };
+}
 
 let timeDomainData = null;
 function ensureTimeDomainBuffer() {
@@ -878,73 +1043,395 @@ function computeVisemeWeights(bands) {
   };
 }
 
-// ── SVG MOUTH SHAPE DEFINITIONS ──
-// Each shape is defined as SVG path data in a 120x80 viewBox
-// Shapes are designed in Matrix green aesthetic
-const MOUTH_SHAPES = {
-  // A: Thin horizontal line (lips together, neutral)
-  A: { d: 'M 25,40 Q 60,42 95,40', fill: 'none', strokeWidth: 2.5 },
-  // B: Small pursed shape (closed consonants M/B/P)
-  B: { d: 'M 40,35 Q 50,30 60,35 Q 68,40 60,45 Q 50,50 40,45 Q 32,40 40,35 Z', fill: 'rgba(0,255,65,0.08)', strokeWidth: 2 },
-  // C: Wide tall oval (open AH)
-  C: { d: 'M 25,30 Q 60,10 95,30 Q 105,45 95,55 Q 60,72 25,55 Q 15,45 25,30 Z', fill: 'rgba(0,255,65,0.12)', strokeWidth: 2.5 },
-  // D: Medium wide, not as tall (E/I)
-  D: { d: 'M 28,35 Q 60,25 92,35 Q 98,42 92,48 Q 60,56 28,48 Q 22,42 28,35 Z', fill: 'rgba(0,255,65,0.10)', strokeWidth: 2 },
-  // E: Small round circle (O/U)
-  E: { d: 'M 42,30 Q 52,22 62,30 Q 70,40 62,50 Q 52,58 42,50 Q 34,40 42,30 Z', fill: 'rgba(0,255,65,0.10)', strokeWidth: 2 },
-  // F: Wide horizontal, teeth showing (F/S/TH)
-  F: {
-    d: 'M 22,35 Q 60,30 98,35 Q 102,40 98,45 Q 60,50 22,45 Q 18,40 22,35 Z',
-    fill: 'rgba(0,255,65,0.06)', strokeWidth: 2,
-    teeth: 'M 35,38 L 45,38 L 45,42 L 35,42 Z M 50,37 L 60,37 L 60,42 L 50,42 Z M 65,37 L 75,37 L 75,42 L 65,42 Z M 80,38 L 88,38 L 88,42 L 80,42 Z'
-  },
-};
+// ── WEBGL MESH MOUTH DEFORMATION ──
+// Renders face as a subdivided mesh grid with per-vertex displacement
+// around the mouth region. This creates smooth, natural mouth opening
+// like Live2D / video game talking heads.
+const faceCanvas = document.getElementById('face-canvas');
+let _gl = null;
+let _glProgram = null;
+let _glMouthInteriorProgram = null;
+let _glTexture = null;
+let _glVerts = null;
+ let _glUVs = null;
+let _glIndices = null;
+let _glBasePositions = null; // original vertex positions for deformation
+let _lastMouthRender = 0;
+let _smoothOpen = 0;
+let _canvasReady = false;
 
-// ── SVG MOUTH RENDERING ──
-// Interpolates between mouth shapes based on viseme weights
-function renderMouthSVG(weights) {
-  // Find the two strongest visemes for blending
-  let sorted = Object.entries(weights)
-    .filter(([k]) => k !== 'A')
-    .sort((a, b) => b[1] - a[1]);
+// Mesh grid resolution
+const GRID_COLS = 32;
+const GRID_ROWS = 48;
 
-  const totalNonA = sorted.reduce((s, [, w]) => s + w, 0);
-  const aWeight = weights.A || 0;
+// Mouth deformation parameters (in UV/texture space, 0..1)
+const MOUTH_CENTER_X = 0.50;  // horizontal center of mouth
+const MOUTH_CENTER_Y = 0.465; // vertical center (measured from pixel analysis)
+const MOUTH_RADIUS_X = 0.08;  // horizontal influence radius
+const MOUTH_RADIUS_Y = 0.06;  // vertical influence radius
+const MAX_OPEN_PX = 0.025;    // max mouth opening in normalized coords (fraction of image height)
 
-  // Position the SVG relative to the image
-  // Portrait is 1024x1536, displayed as object-fit:contain
-  // Mouth area is ~55-60% down, centered
-  positionMouthSVG();
+// WebGL shaders
+const VERT_SRC = `
+  attribute vec2 a_position;
+  attribute vec2 a_texCoord;
+  varying vec2 v_texCoord;
+  void main() {
+    // Convert from pixel coords to clip space (-1..1)
+    gl_Position = vec4(a_position, 0.0, 1.0);
+    v_texCoord = a_texCoord;
+  }
+`;
 
-  // Clear previous
-  let svgContent = '';
-  const green = '#00ff41';
+const FRAG_SRC = `
+  precision mediump float;
+  varying vec2 v_texCoord;
+  uniform sampler2D u_image;
+  void main() {
+    gl_FragColor = texture2D(u_image, v_texCoord);
+  }
+`;
 
-  if (totalNonA < 0.05) {
-    // Mostly silent: show shape A
-    const shape = MOUTH_SHAPES.A;
-    svgContent = `<path d="${shape.d}" fill="${shape.fill || 'none'}" stroke="${green}" stroke-width="${shape.strokeWidth}" stroke-linecap="round" opacity="0.7"/>`;
+// Simple shader for mouth interior (solid dark color)
+const INTERIOR_VERT_SRC = `
+  attribute vec2 a_position;
+  void main() {
+    gl_Position = vec4(a_position, 0.0, 1.0);
+  }
+`;
+const INTERIOR_FRAG_SRC = `
+  precision mediump float;
+  uniform vec4 u_color;
+  void main() {
+    gl_FragColor = u_color;
+  }
+`;
+
+function compileShader(gl, type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error('Shader compile error:', gl.getShaderInfoLog(s));
+    gl.deleteShader(s);
+    return null;
+  }
+  return s;
+}
+
+function createProgram(gl, vSrc, fSrc) {
+  const vs = compileShader(gl, gl.VERTEX_SHADER, vSrc);
+  const fs = compileShader(gl, gl.FRAGMENT_SHADER, fSrc);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    console.error('Program link error:', gl.getProgramInfoLog(prog));
+    return null;
+  }
+  return prog;
+}
+
+function initFaceCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 3); // full retina, cap at 3x
+  let cw, ch;
+
+  // Get the idle image's exact rendered rect
+  const imgRect = idleImg.getBoundingClientRect();
+  const layerRect = document.getElementById('face-layer').getBoundingClientRect();
+
+  if (isMobile) {
+    cw = Math.round(imgRect.width);
+    ch = Math.round(imgRect.height);
   } else {
-    // Blend the shapes — draw each with its weight as opacity
-    // Start with A at its weight
-    if (aWeight > 0.05) {
-      const shapeA = MOUTH_SHAPES.A;
-      svgContent += `<path d="${shapeA.d}" fill="none" stroke="${green}" stroke-width="${shapeA.strokeWidth}" stroke-linecap="round" opacity="${(aWeight * 0.7).toFixed(3)}"/>`;
-    }
+    cw = window.innerWidth;
+    ch = window.innerHeight;
+  }
 
-    // Draw non-A shapes weighted by their scores
-    for (const [key, weight] of sorted) {
-      if (weight < 0.02) continue;
-      const shape = MOUTH_SHAPES[key];
-      const opacity = Math.min(1, weight * 1.2); // slightly boost for visibility
-      svgContent += `<path d="${shape.d}" fill="${shape.fill || 'none'}" stroke="${green}" stroke-width="${shape.strokeWidth}" stroke-linecap="round" opacity="${opacity.toFixed(3)}"/>`;
-      if (shape.teeth && weight > 0.3) {
-        svgContent += `<path d="${shape.teeth}" fill="rgba(0,255,65,0.15)" stroke="${green}" stroke-width="0.5" opacity="${(weight * 0.6).toFixed(3)}"/>`;
+  faceCanvas.width = cw * dpr;
+  faceCanvas.height = ch * dpr;
+  faceCanvas.style.width = cw + 'px';
+  faceCanvas.style.height = ch + 'px';
+
+  // Position canvas exactly over the idle image within face-layer
+  faceCanvas.style.left = Math.round(imgRect.left - layerRect.left) + 'px';
+  faceCanvas.style.top = Math.round(imgRect.top - layerRect.top) + 'px';
+
+  // Store CSS dimensions for buildMeshGrid and renderMouthCanvas
+  faceCanvas._cssDims = { w: cw, h: ch };
+
+  if (!_gl) {
+    const glOpts = {
+      alpha: true,
+      premultipliedAlpha: false,
+      antialias: false,
+      preserveDrawingBuffer: false
+    };
+    _gl = faceCanvas.getContext('webgl', glOpts) || faceCanvas.getContext('experimental-webgl', glOpts);
+    if (!_gl) {
+      console.error('WebGL not available');
+      navigator.sendBeacon('/api/client-error', JSON.stringify({msg: 'WEBGL_UNAVAILABLE'}));
+      return;
+    }
+  }
+
+  const gl = _gl;
+  gl.viewport(0, 0, faceCanvas.width, faceCanvas.height);
+
+  // Create main face program
+  if (!_glProgram) {
+    _glProgram = createProgram(gl, VERT_SRC, FRAG_SRC);
+    _glMouthInteriorProgram = createProgram(gl, INTERIOR_VERT_SRC, INTERIOR_FRAG_SRC);
+  }
+
+  // Build mesh grid (rebuilds vertex positions for current viewport)
+  buildMeshGrid(gl);
+
+  // Invalidate persistent buffers so they get re-uploaded with new mesh data
+  if (_posBuf) {
+    gl.deleteBuffer(_posBuf); gl.deleteBuffer(_uvBuf);
+    gl.deleteBuffer(_idxBuf); gl.deleteBuffer(_interiorBuf);
+    _posBuf = _uvBuf = _idxBuf = _interiorBuf = null;
+  }
+
+  // Upload texture
+  if (!_glTexture && idleImg.naturalWidth) {
+    _glTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, _glTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, idleImg);
+  }
+
+  _canvasReady = true;
+}
+
+function buildMeshGrid(gl) {
+  // Use the canvas CSS dimensions as the coordinate space
+  const dims = faceCanvas._cssDims || { w: window.innerWidth, h: window.innerHeight };
+  const vw = dims.w;
+  const vh = dims.h;
+  const imgAspect = idleImg.naturalWidth / idleImg.naturalHeight;
+  const canvasAspect = vw / vh;
+
+  let dw, dh, dx, dy;
+  if (canvasAspect > imgAspect) {
+    // Canvas is wider than image — fit to height, center horizontally
+    dh = vh; dw = vh * imgAspect;
+    dx = (vw - dw) / 2; dy = 0;
+  } else {
+    // Canvas is taller than image — fit to width, center vertically
+    dw = vw; dh = vw / imgAspect;
+    dx = 0; dy = (vh - dh) / 2;
+  }
+
+  const positions = [];
+  const uvs = [];
+  const indices = [];
+  const basePositions = [];
+
+  // Generate vertices for (GRID_COLS+1) x (GRID_ROWS+1) grid
+  for (let row = 0; row <= GRID_ROWS; row++) {
+    for (let col = 0; col <= GRID_COLS; col++) {
+      const u = col / GRID_COLS;
+      const v = row / GRID_ROWS;
+
+      // Convert to pixel position on screen (CSS pixels)
+      const px = dx + u * dw;
+      const py = dy + v * dh;
+
+      // Convert to clip space: x goes -1 (left) to +1 (right), y goes +1 (top) to -1 (bottom)
+      const clipX = (px / vw) * 2.0 - 1.0;
+      const clipY = 1.0 - (py / vh) * 2.0;
+
+      positions.push(clipX, clipY);
+      basePositions.push(clipX, clipY);
+      uvs.push(u, v);
+    }
+  }
+
+  // Generate triangle indices (two triangles per grid cell)
+  for (let row = 0; row < GRID_ROWS; row++) {
+    for (let col = 0; col < GRID_COLS; col++) {
+      const tl = row * (GRID_COLS + 1) + col;
+      const tr = tl + 1;
+      const bl = (row + 1) * (GRID_COLS + 1) + col;
+      const br = bl + 1;
+      indices.push(tl, bl, tr);  // triangle 1
+      indices.push(tr, bl, br);  // triangle 2
+    }
+  }
+
+  _glBasePositions = new Float32Array(basePositions);
+  _glVerts = new Float32Array(positions);
+  _glUVs = new Float32Array(uvs);
+  _glIndices = new Uint16Array(indices);
+}
+
+// Persistent GPU buffers (created once, reused every frame)
+let _posBuf = null, _uvBuf = null, _idxBuf = null, _interiorBuf = null;
+
+function renderMouthCanvas(openness) {
+  if (!_canvasReady || !_gl || !_glProgram) return;
+
+  const now = performance.now();
+  if (now - _lastMouthRender < 33) return; // ~30fps
+  _lastMouthRender = now;
+
+  // Smooth the openness
+  _smoothOpen += (openness - _smoothOpen) * 0.35;
+  const o = Math.max(0, _smoothOpen);
+
+  const gl = _gl;
+  // Use canvas CSS dims (matches idle image on mobile)
+  const dims = faceCanvas._cssDims || { w: window.innerWidth, h: window.innerHeight };
+  const vw = dims.w;
+  const vh = dims.h;
+
+  // Image display bounds within canvas coordinate space
+  const imgAspect = idleImg.naturalWidth / idleImg.naturalHeight;
+  const canvasAspect = vw / vh;
+  let dw, dh, dx, dy;
+  if (canvasAspect > imgAspect) {
+    dh = vh; dw = vh * imgAspect; dx = (vw - dw) / 2; dy = 0;
+  } else {
+    dw = vw; dh = vw / imgAspect; dx = 0; dy = (vh - dh) / 2;
+  }
+
+  // Reset vertices to base positions
+  _glVerts.set(_glBasePositions);
+
+  // Apply mouth deformation if mouth is open
+  if (o > 0.005) {
+    // Convert MAX_OPEN_PX (fraction of image height) to clip-space units
+    // In clip space, full viewport height = 2.0 units
+    // The image takes up (dh/vh) of the viewport
+    const jawDropClip = o * MAX_OPEN_PX * (dh / vh) * 2.0;
+
+    for (let row = 0; row <= GRID_ROWS; row++) {
+      for (let col = 0; col <= GRID_COLS; col++) {
+        const idx = row * (GRID_COLS + 1) + col;
+        const u = col / GRID_COLS;
+        const v = row / GRID_ROWS;
+
+        // Distance from mouth center in UV space, normalized by radius
+        const distX = (u - MOUTH_CENTER_X) / MOUTH_RADIUS_X;
+        const distY = (v - MOUTH_CENTER_Y) / MOUTH_RADIUS_Y;
+        const dist2 = distX * distX + distY * distY;
+
+        if (dist2 < 1.0) {
+          // Smooth falloff: 1 at center, 0 at edge
+          const t = 1.0 - dist2;
+          const influence = t * t; // quadratic falloff
+
+          // Vertical displacement: upper lip goes up (+clip), jaw goes down (-clip)
+          const aboveMouth = v < MOUTH_CENTER_Y;
+          // Jaw drops 70%, upper lip raises 30%
+          const vertMult = aboveMouth ? 0.3 : 0.7;
+          const vertDir = aboveMouth ? 1.0 : -1.0; // +Y = up in clip space
+          const finalDisp = vertDir * influence * jawDropClip * vertMult;
+
+          _glVerts[idx * 2 + 1] += finalDisp;
+
+          // Slight horizontal stretch near mouth edges for O-shape
+          const hStretch = influence * o * 0.002;
+          if (Math.abs(distX) > 0.2) {
+            _glVerts[idx * 2] += Math.sign(u - MOUTH_CENTER_X) * hStretch;
+          }
+        }
       }
     }
   }
 
-  mouthSvg.innerHTML = svgContent;
+  // ── RENDER ──
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  // Create persistent buffers if needed
+  if (!_posBuf) {
+    _posBuf = gl.createBuffer();
+    _uvBuf = gl.createBuffer();
+    _idxBuf = gl.createBuffer();
+    _interiorBuf = gl.createBuffer();
+
+    // Upload static UV data once
+    gl.bindBuffer(gl.ARRAY_BUFFER, _uvBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, _glUVs, gl.STATIC_DRAW);
+
+    // Upload static index data once
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, _idxBuf);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, _glIndices, gl.STATIC_DRAW);
+  }
+
+  // 1. Draw dark mouth interior (behind the face mesh)
+  if (o > 0.02) {
+    gl.useProgram(_glMouthInteriorProgram);
+
+    // Mouth interior position in CSS pixels -> clip space
+    const mouthPxX = dx + MOUTH_CENTER_X * dw;
+    const mouthPxY = dy + MOUTH_CENTER_Y * dh;
+    const mouthW = dw * 0.06;
+    const mouthH = o * dh * MAX_OPEN_PX * 1.5;
+
+    const cx = (mouthPxX / vw) * 2.0 - 1.0;
+    const cy = 1.0 - (mouthPxY / vh) * 2.0;
+    const hw = (mouthW / vw);
+    const hh = (mouthH / vh);
+
+    const interiorVerts = new Float32Array([
+      cx - hw, cy - hh,
+      cx + hw, cy - hh,
+      cx - hw, cy + hh,
+      cx + hw, cy + hh
+    ]);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, _interiorBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, interiorVerts, gl.DYNAMIC_DRAW);
+
+    const iPosLoc = gl.getAttribLocation(_glMouthInteriorProgram, 'a_position');
+    gl.enableVertexAttribArray(iPosLoc);
+    gl.vertexAttribPointer(iPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+    const iColorLoc = gl.getUniformLocation(_glMouthInteriorProgram, 'u_color');
+    gl.uniform4f(iColorLoc, 0.02, 0.0, 0.0, 0.85 * Math.min(1, o * 3));
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // 2. Draw the face mesh with deformed vertices
+  gl.useProgram(_glProgram);
+
+  // Upload deformed vertex positions (dynamic, changes every frame)
+  gl.bindBuffer(gl.ARRAY_BUFFER, _posBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, _glVerts, gl.DYNAMIC_DRAW);
+  const posLoc = gl.getAttribLocation(_glProgram, 'a_position');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+  // Bind static UV buffer
+  gl.bindBuffer(gl.ARRAY_BUFFER, _uvBuf);
+  const uvLoc = gl.getAttribLocation(_glProgram, 'a_texCoord');
+  gl.enableVertexAttribArray(uvLoc);
+  gl.vertexAttribPointer(uvLoc, 2, gl.FLOAT, false, 0, 0);
+
+  // Bind texture
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, _glTexture);
+  gl.uniform1i(gl.getUniformLocation(_glProgram, 'u_image'), 0);
+
+  // Draw with index buffer
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, _idxBuf);
+  gl.drawElements(gl.TRIANGLES, _glIndices.length, gl.UNSIGNED_SHORT, 0);
+}
+
+// For desktop SVG fallback (not used on mobile)
+function renderMouthSVG(openness, widthFactor) {
+  // noop — canvas handles mouth now
 }
 
 // ── MOUTH POSITIONING ──
@@ -975,7 +1462,7 @@ function positionMouthSVG() {
   // Mouth position: ~57% down, centered horizontally in the portrait
   const mouthCenterX = imgX + imgW * 0.50;
   const mouthCenterY = imgY + imgH * 0.575;
-  const mouthWidth = imgW * 0.12;   // mouth is ~12% of image width
+  const mouthWidth = imgW * (isMobile ? 0.15 : 0.12);   // slightly larger on mobile for visibility
   const mouthHeight = mouthWidth * (80 / 120); // preserve viewBox ratio
 
   mouthSvg.style.width = mouthWidth + 'px';
@@ -994,14 +1481,13 @@ function positionMouthSVG() {
 }
 
 // ── TALK IMAGE OVERLAY ──
-// Still use talk image as subtle overlay for jaw/face movement during high amplitude
+// Subtle jaw/face movement via talk image blend
 function applyTalkOverlay(amplitude) {
   const norm = Math.max(0, Math.min(1, (amplitude - NOISE_FLOOR) / (FULL_OPEN_LEVEL - NOISE_FLOOR)));
-  // Subtle overlay: max 40% opacity, only at high amplitude
-  const talkOpacity = Math.pow(norm, 1.2) * 0.4;
+  // Subtle overlay: max 35% opacity for jaw movement feel
+  const talkOpacity = Math.pow(norm, 1.2) * 0.35;
   talkImg.style.opacity = String(talkOpacity);
   idleImg.style.opacity = '1';
-
   if (norm > 0.05) {
     const scaleY = 1 + norm * 0.008;
     const translateY = norm * 0.2;
@@ -1056,55 +1542,81 @@ function getBreathingScaleY() {
 }
 
 // ── MAIN ANIMATION UPDATE ──
+let _mouthDebugCount = 0;
+let _lastMouthUpdate = 0;
 function updateMouthAnimation() {
   const now = performance.now();
+  // Throttle entire update to ~30fps on mobile
+  if (isMobile && now - _lastMouthUpdate < 33) {
+    requestAnimationFrame(updateMouthAnimation);
+    return;
+  }
+  _lastMouthUpdate = now;
 
-  if (isPlaying && analyser && volumeData) {
-    const bands = getFrequencyBands();
-    const amplitude = getAudioAmplitude();
+  if (isPlaying) {
+    let openness = 0;
+    let amplitude = 0;
 
-    // Compute viseme targets from frequency bands
-    visemeTargets = computeVisemeWeights(bands);
+    // Try real analyser first
+    let useAnalyser = false;
+    if (analyser && volumeData) {
+      const bands = getFrequencyBands();
+      amplitude = getAudioAmplitude();
 
-    // Smooth interpolation toward targets (fast attack, slow release)
-    for (const key of ['A', 'B', 'C', 'D', 'E', 'F']) {
-      const diff = visemeTargets[key] - visemeWeights[key];
-      const speed = diff > 0 ? 0.25 : 0.12;
-      visemeWeights[key] += diff * speed;
-      visemeWeights[key] = Math.max(0, Math.min(1, visemeWeights[key]));
-    }
+      if (_analyserWorking === null) {
+        _analyserCheckFrames++;
+        _analyserSum += bands.total;
+        if (_analyserCheckFrames >= 10) {
+          _analyserWorking = (_analyserSum / _analyserCheckFrames) > 1;
+          if (!_analyserWorking) {
+            navigator.sendBeacon('/api/client-error', JSON.stringify({
+              msg: 'MOUTH_FALLBACK', reason: 'analyser_zeros',
+              ctxState: audioCtx ? audioCtx.state : 'none'
+            }));
+          }
+        }
+      }
+      useAnalyser = (_analyserWorking === true) || (_analyserWorking === null && bands.total > 1);
 
-    // Render SVG mouth
-    renderMouthSVG(visemeWeights);
-
-    // Subtle talk image overlay for jaw movement
-    applyTalkOverlay(amplitude);
-
-    // Legacy compat
-    mouthOpenness = 1 - visemeWeights.A;
-
-  } else if (!isPlaying) {
-    // Ease visemes back to A (silent)
-    let anyActive = false;
-    for (const key of ['B', 'C', 'D', 'E', 'F']) {
-      if (visemeWeights[key] > 0.005) {
-        visemeWeights[key] *= 0.88; // decay
-        anyActive = true;
-      } else {
-        visemeWeights[key] = 0;
+      if (useAnalyser) {
+        openness = Math.max(0, Math.min(1, (amplitude - NOISE_FLOOR) / (FULL_OPEN_LEVEL - NOISE_FLOOR)));
       }
     }
-    visemeWeights.A = 1 - (visemeWeights.B + visemeWeights.C + visemeWeights.D + visemeWeights.E + visemeWeights.F);
 
-    renderMouthSVG(visemeWeights);
+    if (!useAnalyser) {
+      const synth = getSyntheticMouth(now);
+      openness = synth.openness;
+      amplitude = synth.amplitude;
+    }
 
-    if (!anyActive) {
+    // Crossfade to canvas: pre-render first frame before revealing
+    if (faceCanvas.style.opacity !== '1') {
+      if (!_canvasReady) initFaceCanvas();
+      // Pre-render with current openness so the first visible frame matches
+      renderMouthCanvas(openness);
+      // Now reveal canvas and hide idle image (not face-layer — canvas is inside it)
+      faceCanvas.style.opacity = '1';
+      idleImg.style.visibility = 'hidden';
+      talkImg.style.visibility = 'hidden';
+    }
+
+    // Render deformed face to canvas
+    renderMouthCanvas(openness);
+
+    mouthOpenness = openness;
+
+  } else if (!isPlaying) {
+    // Ease mouth closed on canvas
+    if (_smoothOpen > 0.01) {
+      renderMouthCanvas(0);
+    } else if (faceCanvas.style.opacity === '1') {
+      // Crossfade back: show idle image first, then fade canvas out
+      idleImg.style.visibility = 'visible';
+      idleImg.style.opacity = '1';
       talkImg.style.opacity = '0';
       talkImg.style.transform = '';
-      idleImg.style.opacity = '1';
+      faceCanvas.style.opacity = '0';
       mouthOpenness = 0;
-    } else {
-      applyTalkOverlay(mouthOpenness * FULL_OPEN_LEVEL);
     }
   }
 
@@ -1119,84 +1631,349 @@ function stopTalking() {
 }
 
 // Reposition on resize
-window.addEventListener('resize', positionMouthSVG);
+window.addEventListener('resize', () => {
+  positionMouthSVG();
+  if (faceCanvas.style.opacity === '1') initFaceCanvas();
+});
 
-// ── MIC + SPEECH RECOGNITION ──
-let isRecording = false;
-let recognition = null;
-
-function getSpeechRecognition() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) return null;
-  const r = new SR();
-  r.continuous = false;
-  r.interimResults = false;
-  r.lang = 'en-US';
-  r.maxAlternatives = 1;
-  return r;
+// ── LIVEKIT VOICE ──
+// Polyfill navigator.mediaDevices for insecure contexts (HTTP).
+// The LiveKit SDK crashes if mediaDevices is undefined.
+// This stub prevents the crash; actual mic capture will still fail gracefully.
+if (!navigator.mediaDevices) {
+  console.warn('Insecure context: stubbing navigator.mediaDevices');
+  navigator.mediaDevices = {
+    getUserMedia: () => Promise.reject(new DOMException('getUserMedia requires HTTPS', 'NotAllowedError')),
+    enumerateDevices: () => Promise.resolve([]),
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => true,
+  };
 }
 
-async function startRecording() {
-  ensureAudioCtx();
-  if (isBusy || isPlaying) {
-    interruptDude();
-    await new Promise(r => setTimeout(r, 50));
-  }
+const LK_SDK_URL = 'https://cdn.jsdelivr.net/npm/livekit-client@2.17.3/dist/livekit-client.umd.min.js';
+let LK = window.LivekitClient || null; // will be set after lazy load
+let lkSdkLoading = false;
+let lkSdkLoaded = !!LK;
 
-  recognition = getSpeechRecognition();
-  if (!recognition) {
-    setStatus('Speech recognition not supported, man');
+function loadLivekitSDK() {
+  return new Promise((resolve, reject) => {
+    if (lkSdkLoaded && LK) { resolve(LK); return; }
+    if (lkSdkLoading) {
+      // Wait for existing load
+      const check = setInterval(() => {
+        if (lkSdkLoaded) { clearInterval(check); resolve(LK); }
+      }, 100);
+      return;
+    }
+    lkSdkLoading = true;
+    console.log('Loading LiveKit SDK...');
+    const script = document.createElement('script');
+    script.src = LK_SDK_URL;
+    script.crossOrigin = 'anonymous';
+    script.onload = () => {
+      LK = window.LivekitClient;
+      lkSdkLoaded = true;
+      lkSdkLoading = false;
+      console.log('LiveKit SDK loaded OK. Room:', typeof LK.Room);
+      resolve(LK);
+    };
+    script.onerror = (e) => {
+      lkSdkLoading = false;
+      console.error('Failed to load LiveKit SDK:', e);
+      navigator.sendBeacon && navigator.sendBeacon('/api/client-error', JSON.stringify({msg: 'LIVEKIT_SDK_LOAD_FAILED'}));
+      reject(new Error('Failed to load voice SDK'));
+    };
+    document.head.appendChild(script);
+  });
+}
+
+let lkRoom = null;
+let lkConnected = false;
+let lkConnecting = false;
+let lkAgentAudioEl = null;  // <audio> element for agent's voice
+let lkAgentSource = null;   // MediaElementSource or MediaStreamSource for analyser
+let lkAgentText = '';       // accumulated agent transcription
+let lkSegments = {};        // segment_id → text for building full response
+let lkOrigAnalyser = null;  // saved reference to original analyser
+let lkOrigVolumeData = null; // saved reference to original volumeData
+
+// Token endpoint — proxied through main server (same origin, no CORS issues)
+const LK_TOKEN_URL = API + '/api/livekit-token';
+
+async function lkConnect() {
+  if (lkConnected || lkConnecting) return;
+  lkConnecting = true;
+  ensureAudioCtx();
+  micBtn.classList.add('recording');
+  setStatus('Loading voice...');
+
+  // Lazy-load SDK if not already loaded
+  try {
+    await loadLivekitSDK();
+  } catch (e) {
+    setStatus('Voice SDK failed to load, man');
     setTimeout(() => setStatus(''), 3000);
+    lkConnecting = false;
+    micBtn.classList.remove('recording');
     return;
   }
-
-  isRecording = true;
-  micBtn.classList.add('recording');
-  setStatus('Listening...');
-
-  recognition.onresult = (event) => {
-    const transcript = event.results[0][0].transcript;
-    console.log('You said:', transcript);
-    stopRecording();
-    if (transcript.trim()) {
-      sendMessage(transcript.trim());
-    }
-  };
-
-  recognition.onerror = (event) => {
-    console.error('Speech recognition error:', event.error);
-    stopRecording();
-    if (event.error === 'no-speech') {
-      setStatus('No speech detected, man');
-    } else if (event.error === 'not-allowed') {
-      setStatus('Mic access denied, man');
-    } else {
-      setStatus('Voice error: ' + event.error);
-    }
-    setTimeout(() => setStatus(''), 3000);
-  };
-
-  recognition.onend = () => {
-    if (isRecording) stopRecording();
-  };
+  setStatus('Connecting...');
 
   try {
-    recognition.start();
+    // Step 1: Get token
+    setStatus('Getting token...');
+    console.log('Fetching token from:', LK_TOKEN_URL);
+    const resp = await fetch(LK_TOKEN_URL);
+    if (!resp.ok) throw new Error('Token server returned ' + resp.status);
+    const { token, url } = await resp.json();
+    console.log('LiveKit token obtained, connecting to', url);
+    setStatus('Connecting to voice...');
+
+    // Create room - skip audio capture defaults on insecure origins (no mediaDevices)
+    const hasMediaDevices = window.isSecureContext && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+    lkRoom = new LK.Room({ adaptiveStream: true, dynacast: true });
+
+    // ── Event: remote audio track subscribed (agent's TTS voice) ──
+    lkRoom.on(LK.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+      console.log('TrackSubscribed:', track.kind, 'from', participant.identity);
+      if (track.kind === LK.Track.Kind.Audio) {
+        lkAttachAgentAudio(track);
+      }
+    });
+
+    // ── Event: track unsubscribed ──
+    lkRoom.on(LK.RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+      console.log('TrackUnsubscribed:', track.kind, 'from', participant.identity);
+      if (track.kind === LK.Track.Kind.Audio) {
+        lkDetachAgentAudio();
+      }
+    });
+
+    // ── Event: disconnected ──
+    lkRoom.on(LK.RoomEvent.Disconnected, (reason) => {
+      console.log('LiveKit disconnected:', reason);
+      lkCleanup();
+      setStatus('Disconnected, man');
+      setTimeout(() => setStatus(''), 3000);
+    });
+
+    // ── Event: active speakers changed (for mouth animation awareness) ──
+    lkRoom.on(LK.RoomEvent.ActiveSpeakersChanged, (speakers) => {
+      if (!lkRoom) return;
+      const agentSpeaking = speakers.some(s => s.identity !== lkRoom.localParticipant.identity);
+      if (agentSpeaking && !isPlaying) {
+        isPlaying = true;
+        // Clear previous segments for new turn
+        lkSegments = {};
+        lkAgentText = '';
+      } else if (!agentSpeaking && isPlaying) {
+        // Small delay before stopping — audio may still be playing
+        setTimeout(() => {
+          if (!lkRoom) return;
+          const stillSpeaking = lkRoom.activeSpeakers && 
+            lkRoom.activeSpeakers.some(s => s.identity !== lkRoom.localParticipant.identity);
+          if (!stillSpeaking) {
+            isPlaying = false;
+            stopTalking();
+            scheduleFadeDudeText();
+          }
+        }, 500);
+      }
+    });
+
+    // ── Transcription handler — agent speech text ──
+    // Try the newer registerTextStreamHandler API first, fall back to RoomEvent.TranscriptionReceived
+    if (typeof lkRoom.registerTextStreamHandler === 'function') {
+      console.log('Using registerTextStreamHandler for transcriptions');
+      lkRoom.registerTextStreamHandler('lk.transcription', async (reader, participantInfo) => {
+        const isAgent = participantInfo.identity !== lkRoom.localParticipant.identity;
+        const segId = reader.info.attributes['lk.segment_id'] || '';
+        const isFinal = reader.info.attributes['lk.transcription_final'] === 'true';
+        const text = await reader.readAll();
+
+        if (isAgent) {
+          lkSegments[segId] = text;
+          lkAgentText = Object.values(lkSegments).join(' ');
+          showDudeText(lkAgentText);
+          console.log('Agent transcript:', isFinal ? '[FINAL]' : '[interim]', text);
+        } else {
+          if (isFinal && text.trim()) {
+            console.log('User said:', text);
+          }
+        }
+      });
+    } else if (LK.RoomEvent.TranscriptionReceived) {
+      console.log('Using TranscriptionReceived event for transcriptions');
+      lkRoom.on(LK.RoomEvent.TranscriptionReceived, (segments, participant, publication) => {
+        const isAgent = participant && participant.identity !== lkRoom.localParticipant.identity;
+        if (isAgent && segments && segments.length > 0) {
+          for (const seg of segments) {
+            lkSegments[seg.id] = seg.text;
+          }
+          lkAgentText = Object.values(lkSegments).join(' ');
+          showDudeText(lkAgentText);
+          console.log('Agent transcript (event):', segments.map(s => s.text).join(' '));
+        }
+      });
+    } else {
+      console.warn('No transcription API available in this LiveKit SDK version');
+    }
+
+    // Step 2: Connect to LiveKit Cloud
+    setStatus('Joining room...');
+    await lkRoom.connect(url, token);
+    console.log('Connected to LiveKit room:', lkRoom.name);
+
+    // Step 3: Enable microphone (only on secure contexts)
+    if (hasMediaDevices) {
+      setStatus('Enabling mic...');
+      try {
+        await lkRoom.localParticipant.setMicrophoneEnabled(true);
+        console.log('Microphone published');
+      } catch (micErr) {
+        console.warn('Mic enable failed, trying without constraints:', micErr);
+        try {
+          await lkRoom.localParticipant.setMicrophoneEnabled(true, { audio: true });
+          console.log('Microphone published (no constraints)');
+        } catch (micErr2) {
+          console.warn('Mic unavailable, listen-only mode:', micErr2);
+        }
+      }
+      lkConnected = true;
+      lkConnecting = false;
+      setStatus(lkRoom.localParticipant.isMicrophoneEnabled ? 'Listening...' : 'Voice connected (type to talk)');
+    } else {
+      // HTTP / insecure context: mic unavailable, listen-only voice mode
+      console.warn('No mediaDevices (insecure context): listen-only voice mode');
+      lkConnected = true;
+      lkConnecting = false;
+      setStatus('Voice connected (type to talk)');
+      setTimeout(() => setStatus(''), 4000);
+    }
+
+    // Check for any already-subscribed tracks (in case agent joined first)
+    lkRoom.remoteParticipants.forEach((participant) => {
+      participant.trackPublications.forEach((pub) => {
+        if (pub.track && pub.track.kind === LK.Track.Kind.Audio) {
+          lkAttachAgentAudio(pub.track);
+        }
+      });
+    });
+
   } catch (err) {
-    console.error('Mic error:', err);
-    setStatus('Mic access denied, man');
+    console.error('LiveKit connect error:', err);
+    navigator.sendBeacon && navigator.sendBeacon('/api/client-error', JSON.stringify({
+      msg: 'LK_CONNECT_ERROR', error: String(err), stack: err && err.stack ? err.stack.substring(0, 500) : ''
+    }));
+    setStatus('Voice connect failed, man');
     setTimeout(() => setStatus(''), 3000);
-    stopRecording();
+    lkConnecting = false;
+    micBtn.classList.remove('recording');
   }
 }
 
-function stopRecording() {
-  isRecording = false;
-  micBtn.classList.remove('recording');
-  if (recognition) {
-    try { recognition.stop(); } catch(e) {}
-    recognition = null;
+function lkAttachAgentAudio(track) {
+  console.log('Attaching agent audio track to analyser, isMobile:', isMobile);
+  ensureAudioCtx();
+
+  // Detach previous if any
+  lkDetachAgentAudio();
+
+  // Strategy:
+  // 1. Use track.attach() for an <audio> element (reliable WebRTC playback)
+  // 2. Tap into the audio for analyser data (mouth animation)
+  //
+  // On desktop: createMediaElementSource captures <audio> output,
+  //   routes through analyser -> destination (speakers).
+  // On mobile: createMediaStreamSource from the raw track for analyser only,
+  //   let the <audio> element handle playback separately (avoids iOS quirks).
+
+  lkAgentAudioEl = track.attach();
+  lkAgentAudioEl.setAttribute('playsinline', '');
+  lkAgentAudioEl.style.display = 'none';
+  document.body.appendChild(lkAgentAudioEl);
+
+  if (isMobile) {
+    // Mobile: use MediaStreamSource for analyser data only (no audio routing)
+    // The <audio> element handles playback directly
+    try {
+      const msTrack = track.mediaStreamTrack;
+      if (msTrack) {
+        const stream = new MediaStream([msTrack]);
+        lkAgentSource = audioCtx.createMediaStreamSource(stream);
+        // Connect to a separate analyser or the existing one but NOT to destination
+        // to avoid double-playback. We just need frequency data for mouth animation.
+        // Create a dedicated analyser that doesn't route to output.
+        const lkAnalyser = audioCtx.createAnalyser();
+        lkAnalyser.fftSize = 256;
+        lkAnalyser.smoothingTimeConstant = 0.3;
+        lkAgentSource.connect(lkAnalyser);
+        // Save original analyser and swap so mouth animation reads from this one
+        lkOrigAnalyser = analyser;
+        lkOrigVolumeData = volumeData;
+        analyser = lkAnalyser;
+        volumeData = new Uint8Array(lkAnalyser.frequencyBinCount);
+        console.log('Mobile: agent audio analyser connected (playback via <audio>)');
+      }
+    } catch (e) {
+      console.warn('Mobile: could not connect analyser:', e);
+    }
+  } else {
+    // Desktop: createMediaElementSource captures <audio> and routes through graph
+    try {
+      lkAgentSource = audioCtx.createMediaElementSource(lkAgentAudioEl);
+      lkAgentSource.connect(analyser);
+      console.log('Desktop: agent audio routed through analyser via MediaElementSource');
+    } catch (e) {
+      console.warn('Desktop: could not route agent audio through analyser:', e);
+      // Audio still plays through the <audio> element directly
+    }
   }
+
+  isPlaying = true;
+}
+
+function lkDetachAgentAudio() {
+  if (lkAgentSource) {
+    try { lkAgentSource.disconnect(); } catch(e) {}
+    lkAgentSource = null;
+  }
+  if (lkAgentAudioEl) {
+    lkAgentAudioEl.pause();
+    lkAgentAudioEl.srcObject = null;
+    lkAgentAudioEl.remove();
+    lkAgentAudioEl = null;
+  }
+}
+
+async function lkDisconnect() {
+  if (lkRoom) {
+    await lkRoom.disconnect();
+  }
+  lkCleanup();
+}
+
+function lkCleanup() {
+  lkDetachAgentAudio();
+  // Restore original analyser if we swapped it (mobile path)
+  if (lkOrigAnalyser) {
+    analyser = lkOrigAnalyser;
+    volumeData = lkOrigVolumeData;
+    lkOrigAnalyser = null;
+    lkOrigVolumeData = null;
+  }
+  lkConnected = false;
+  lkConnecting = false;
+  lkAgentText = '';
+  lkSegments = {};
+  micBtn.classList.remove('recording');
+  if (lkRoom) {
+    lkRoom = null;
+  }
+  isPlaying = false;
+  stopTalking();
+  scheduleFadeDudeText();
 }
 
 // ── EVENTS ──
@@ -1222,38 +1999,68 @@ textInput.addEventListener('input', () => {
 });
 
 micBtn.addEventListener('click', () => {
-  if (isRecording) {
-    stopRecording();
+  if (lkConnected) {
+    lkDisconnect();
   } else {
-    startRecording();
+    lkConnect();
   }
 });
 
+// ── MOBILE DETECTION (defined earlier, near top of script) ──
+// const isMobile — already defined above
+
+// Unlock audio on any early user interaction (tap, focus, etc.)
+if (isMobile) {
+  const unlockEvents = ['touchstart', 'touchend', 'click'];
+  const unlockHandler = () => {
+    ensureAudioCtx();
+    unlockEvents.forEach(e => document.removeEventListener(e, unlockHandler, true));
+  };
+  unlockEvents.forEach(e => document.addEventListener(e, unlockHandler, { capture: true, once: false, passive: true }));
+}
+
 // ── MATRIX RAIN ──
+// On mobile, use ONLY the background canvas at half resolution (saves ~80MB)
+// and skip the overlay canvas entirely to stay within Safari memory limits.
+if (isMobile) {
+  // Kill overlay canvas on mobile — one half-res canvas is enough
+  olCanvas.width = olCanvas.height = 0;
+  olCanvas.style.display = 'none';
+}
 function resizeCanvases() {
-  bgCanvas.width = olCanvas.width = window.innerWidth;
-  bgCanvas.height = olCanvas.height = window.innerHeight;
+  if (isMobile) {
+    // Half resolution on mobile to avoid OOM (~12MB vs ~48MB per canvas)
+    bgCanvas.width = Math.floor(window.innerWidth / 2);
+    bgCanvas.height = Math.floor(window.innerHeight / 2);
+  } else {
+    bgCanvas.width = olCanvas.width = window.innerWidth;
+    bgCanvas.height = olCanvas.height = window.innerHeight;
+  }
 }
 resizeCanvases();
 window.addEventListener('resize', resizeCanvases);
 
 const matrixChars = 'アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン日月木水火土金0123456789';
-const fontSize = 14;
+const fontSize = isMobile ? 8 : 14;
 
 function createRainState(w) {
   const cols = Math.floor(w / fontSize);
+  const spdBase = isMobile ? 0.25 : 0.15;
+  const spdRange = isMobile ? 0.9 : 0.75;
   return {
     drops: Array.from({length: cols}, () => Math.random() * -100),
-    speeds: Array.from({length: cols}, () => 0.15 + Math.random() * 0.75),
+    speeds: Array.from({length: cols}, () => spdBase + Math.random() * spdRange),
     bright: Array.from({length: cols}, () => Math.random()),
   };
 }
-let bgRain = createRainState(window.innerWidth);
-let olRain = createRainState(window.innerWidth);
+let bgRain = createRainState(isMobile ? Math.floor(window.innerWidth / 2) : window.innerWidth);
+let olRain = isMobile ? null : createRainState(window.innerWidth);
 window.addEventListener('resize', () => {
   resizeCanvases();
-  bgRain = createRainState(window.innerWidth);
-  olRain = createRainState(window.innerWidth);
+  bgRain = createRainState(isMobile ? Math.floor(window.innerWidth / 2) : window.innerWidth);
+  if (!isMobile) {
+    olRain = createRainState(window.innerWidth);
+  }
 });
 
 function drawRainLayer(ctx, rain, fade) {
@@ -1293,11 +2100,16 @@ function updateBreathing() {
   const f = `drop-shadow(0 0 ${g1}px rgba(0,255,65,${0.22*i})) drop-shadow(0 0 ${g2}px rgba(0,255,65,${0.08*i}))`;
   idleImg.style.filter = f;
   talkImg.style.filter = f;
+  // Also apply breathing glow to WebGL canvas when it's active
+  if (faceCanvas.style.opacity === '1') {
+    faceCanvas.style.filter = f;
+  }
 }
 
 // ── CRT ──
 let crtGlitchX = 0;
 function crtEffects() {
+  if (isMobile) return; // Skip CRT on mobile to save resources
   const layer = document.getElementById('face-layer');
   if (Math.random() > 0.97) {
     layer.style.opacity = String(0.7 + Math.random() * 0.3);
@@ -1307,14 +2119,23 @@ function crtEffects() {
     crtGlitchX = (Math.random() - 0.5) * 10;
     setTimeout(() => { crtGlitchX = 0; }, 35 + Math.random() * 80);
   }
-  requestAnimationFrame(crtEffects);
+  if (!isMobile) requestAnimationFrame(crtEffects);
 }
 
 // ── MAIN LOOP ──
-function mainLoop() {
-  drawRainLayer(bgCtx, bgRain, 0.045);
-  drawRainLayer(olCtx, olRain, 0.055);
-  updateBreathing();
+let lastMainFrame = 0;
+function mainLoop(ts) {
+  if (isMobile) {
+    // Throttle to ~15fps on mobile to save battery
+    if (ts - lastMainFrame < 66) { requestAnimationFrame(mainLoop); return; }
+    lastMainFrame = ts;
+    if (bgRain) drawRainLayer(bgCtx, bgRain, 0.03);
+    updateBreathing();
+  } else {
+    if (bgRain) drawRainLayer(bgCtx, bgRain, 0.045);
+    if (olRain) drawRainLayer(olCtx, olRain, 0.055);
+    updateBreathing();
+  }
   requestAnimationFrame(mainLoop);
 }
 
@@ -1367,6 +2188,21 @@ talkImg.onload = onReady;
 if (idleImg.complete) loaded++;
 if (talkImg.complete) loaded++;
 tryStart();
+
+// ── Fullscreen toggle on F key ──
+document.addEventListener("keydown", (e) => {
+  // Skip if user is typing in an input
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.isContentEditable) return;
+  if (e.key === "f" || e.key === "F") {
+    e.preventDefault();
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+      const el = document.documentElement;
+      (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+    } else {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    }
+  }
+});
 </script>
 </body>
 </html>
