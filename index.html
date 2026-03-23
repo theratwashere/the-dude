@@ -39,6 +39,8 @@
     width: 100%; height: 100%;
     display: flex; align-items: center; justify-content: center;
     z-index: 1;
+    opacity: 0;
+    transition: opacity 3s ease;
   }
   #face-layer img {
     height: 100vh; width: 100vw;
@@ -181,7 +183,7 @@
   #boot-screen.hidden { opacity: 0; pointer-events: none; }
   #boot-text {
     font-family: 'Courier New', monospace;
-    font-size: clamp(10px, 2.5vw, 16px);
+    font-size: clamp(14px, 4.5vw, 28px);
     color: #00ff41; text-shadow: 0 0 8px #00ff41;
     white-space: pre; line-height: 1.8; padding: 20px;
   }
@@ -191,7 +193,36 @@
     font-family: 'Courier New', monospace;
     font-size: 8px; color: rgba(0,255,65,0.12); text-decoration: none;
   }
-</style>
+
+  #dudeLog {
+    position: fixed;
+    bottom: 80px;
+    left: 20px;
+    right: 20px;
+    max-height: 30vh;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    color: #c3e88d;
+    background: rgba(0, 8, 0, 0.8);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(0, 255, 65, 0.15);
+    border-radius: 8px;
+    padding: 10px 14px;
+    z-index: 12;
+    scrollbar-width: thin;
+    scrollbar-color: #00ff41 transparent;
+    display: none;
+  }
+  #dudeLog::-webkit-scrollbar { width: 4px; }
+  #dudeLog::-webkit-scrollbar-thumb { background: #00ff41; border-radius: 2px; }
+  #dudeLog .log-entry { margin-bottom: 4px; }
+  #dudeLog .log-entry:last-child { opacity: 1; }
+  #dudeLog .log-input { color: #4fc3f7; }
+  #dudeLog .log-action { color: #ffb74d; font-style: italic; }
+  #dudeLog .log-result { color: #c3e88d; }
+
+  </style>
 </head>
 <body>
 
@@ -256,6 +287,7 @@ let volumeData = null;
 let isPlaying = false;
 let audioQueue = [];
 let playingAudio = false;
+let conversationMode = false;  // continuous listening mode
 let currentAudioEl = null;   // HTML5 Audio element for playback
 let currentSource = null;    // MediaElementSource for analyser
 let abortController = null;
@@ -445,7 +477,12 @@ async function processSSEStream(response) {
         switch (event.type) {
           case 'text':
             fullText += event.chunk;
-            showDudeText(fullText);
+            // Strip bash blocks from spoken text, show summary in log
+            let displayText = fullText.replace(/```[a-z]*\n[\s\S]*?```/g, '').replace(/\n{3,}/g, '\n\n').trim();
+            showDudeText(displayText || 'Working on it, man...');
+            break;
+          case 'log':
+            addLogEntry(event.kind, event.message);
             if (fullText.length === event.chunk.length) setStatus('');
             break;
 
@@ -501,6 +538,15 @@ async function drainAudioQueue() {
   stopTalking();
   scheduleFadeDudeText();
   setBusy(false);
+
+  // Continuous conversation: only auto-restart old-style recording if NOT on WebSocket
+  if (conversationMode && (!voiceWS || voiceWS.readyState !== WebSocket.OPEN)) {
+    setTimeout(() => {
+      if (!isRecording && !isBusy && !isPlaying) {
+        startRecording();
+      }
+    }, 600);
+  }
 }
 
 function playAudioChunk(b64mp3) {
@@ -693,23 +739,11 @@ function updateMouthAnimation() {
 }
 
 function applyMouthVisuals(openness) {
-  // Crossfade between idle and talk images based on openness
-  // Use a power curve so low openness = very subtle, high = dramatic
-  const talkOpacity = Math.pow(openness, 0.6);
-  talkImg.style.opacity = String(talkOpacity);
-  
-  // Keep idle always at full — talk overlays on top
-  idleImg.style.opacity = '1';
-  
-  // Add subtle jaw stretch via CSS transform on talk image
-  // This adds a bit of vertical "pull" that makes movement feel more physical
-  if (openness > 0.05) {
-    const scaleY = 1 + openness * 0.012; // very subtle: up to 1.2% stretch
-    const translateY = openness * 0.3;    // tiny downward shift in %
-    talkImg.style.transform = `scaleY(${scaleY}) translateY(${translateY}%)`;
-  } else {
-    talkImg.style.transform = '';
-  }
+  // Heartbeat brightness pulse on idle image only - no talk image swap
+  talkImg.style.opacity = '0';
+  const brightness = 1 + openness * 0.6;  // pulse up to 1.6x brightness
+  const glow = openness * 40;  // green glow intensity
+  idleImg.style.filter = `brightness(${brightness}) drop-shadow(0 0 ${glow}px rgba(0,255,65,0.4))`;
 }
 
 function stopTalking() {
@@ -832,12 +866,247 @@ textInput.addEventListener('input', () => {
 });
 
 micBtn.addEventListener('click', () => {
-  if (isRecording) {
-    stopRecording();
+  if (voiceWS && voiceWS.readyState === WebSocket.OPEN) {
+    // End WebSocket conversation, go back to wake word listening
+    stopConversationWS();
+    startWakeWordListener();
+    setStatus('Say "hey dude"...');
+  } else if (wakeRecognition) {
+    // Stop wake word listening
+    stopWakeWordListener();
+    micBtn.classList.remove('recording');
+    setStatus('');
   } else {
-    startRecording();
+    // Start listening for "hey dude" wake word
+    startWakeWordListener();
+    micBtn.classList.add('recording');
+    setStatus('Say "hey dude"...');
   }
 });
+
+
+
+
+// ── WEBSOCKET VOICE (continuous conversation) ──
+let voiceWS = null;
+let wsMicStream = null;
+let wsAudioProcessor = null;
+let wsAudioCtx = null;
+
+function startConversationWS() {
+  if (voiceWS && voiceWS.readyState === WebSocket.OPEN) return;
+
+  ensureAudioCtx();
+  conversationMode = true;
+  micBtn.classList.add('recording');
+  setStatus('Connecting...');
+
+  // Build WebSocket URL (handle HTTPS → WSS)
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = proto + '//' + location.host + '/ws/voice';
+  voiceWS = new WebSocket(wsUrl);
+
+  voiceWS.onopen = async () => {
+    console.log('Voice WS connected');
+    setStatus('Listening...');
+
+    try {
+      wsMicStream = await navigator.mediaDevices.getUserMedia({ audio: {
+        sampleRate: 16000,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      }});
+
+      // Use ScriptProcessorNode to get raw PCM (AudioWorklet is better but more complex)
+      wsAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const source = wsAudioCtx.createMediaStreamSource(wsMicStream);
+      wsAudioProcessor = wsAudioCtx.createScriptProcessor(4096, 1, 1);
+
+      wsAudioProcessor.onaudioprocess = (e) => {
+        if (!voiceWS || voiceWS.readyState !== WebSocket.OPEN) return;
+        if (isPlaying) return;  // Don't send audio while Dude is talking
+
+        const float32 = e.inputBuffer.getChannelData(0);
+        // Convert Float32 [-1,1] to Int16
+        const int16 = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+          const s = Math.max(-1, Math.min(1, float32[i]));
+          int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        voiceWS.send(int16.buffer);
+      };
+
+      source.connect(wsAudioProcessor);
+      wsAudioProcessor.connect(wsAudioCtx.destination);
+
+    } catch (err) {
+      console.error('Mic error:', err);
+      setStatus('Mic access denied, man');
+      stopConversationWS();
+    }
+  };
+
+  voiceWS.onmessage = async (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+
+    switch (msg.type) {
+      case 'listening':
+        setStatus('Listening...');
+        micBtn.classList.add('recording');
+        setBusy(false);
+        break;
+
+      case 'processing':
+        setStatus('thinking');
+        setBusy(true);
+        break;
+
+      case 'transcription':
+        console.log('You said:', msg.text);
+        break;
+
+      case 'text':
+        if (!wsFullText) wsFullText = '';
+        wsFullText += msg.chunk;
+        showDudeText(wsFullText);
+        if (wsFullText.length === msg.chunk.length) setStatus('');
+        break;
+
+      case 'audio':
+        console.log('Audio received:', msg.data.length, 'chars');
+        audioQueue.push(msg.data);
+        if (!playingAudio) drainAudioQueue();
+        break;
+
+      case 'done':
+        console.log('Response done');
+        wsFullText = '';
+        // drainAudioQueue will handle setBusy(false) and re-listening
+        if (audioQueue.length === 0 && !playingAudio) {
+          scheduleFadeDudeText();
+          setBusy(false);
+        }
+        break;
+
+      case 'interrupted':
+        console.log('Interrupted');
+        stopAllAudio();
+        audioQueue = [];
+        break;
+
+      case 'error':
+        setStatus(msg.message || 'Something went wrong');
+        setTimeout(() => setStatus(''), 3000);
+        break;
+    }
+  };
+
+  voiceWS.onclose = () => {
+    console.log('Voice WS closed');
+    cleanupWS();
+  };
+
+  voiceWS.onerror = (err) => {
+    console.error('Voice WS error:', err);
+    cleanupWS();
+    setStatus('Connection lost');
+    setTimeout(() => setStatus(''), 3000);
+  };
+}
+
+let wsFullText = '';
+
+function stopConversationWS() {
+  conversationMode = false;
+  if (voiceWS && voiceWS.readyState === WebSocket.OPEN) {
+    try { voiceWS.send('stop'); } catch(e) {}
+    voiceWS.close();
+  }
+  cleanupWS();
+}
+
+function cleanupWS() {
+  micBtn.classList.remove('recording');
+  if (wsAudioProcessor) {
+    try { wsAudioProcessor.disconnect(); } catch(e) {}
+    wsAudioProcessor = null;
+  }
+  if (wsMicStream) {
+    wsMicStream.getTracks().forEach(t => t.stop());
+    wsMicStream = null;
+  }
+  if (wsAudioCtx && wsAudioCtx.state !== 'closed') {
+    try { wsAudioCtx.close(); } catch(e) {}
+    wsAudioCtx = null;
+  }
+  voiceWS = null;
+  conversationMode = false;
+  setStatus('');
+}
+
+// ── WAKE WORD ("dude") ──
+let wakeRecognition = null;
+function startWakeWordListener() {
+  if (!('webkitSpeechRecognition' in window)) {
+    console.warn('Wake word: Speech Recognition API not available');
+    return;
+  }
+  wakeRecognition = new webkitSpeechRecognition();
+  wakeRecognition.continuous = true;
+  wakeRecognition.interimResults = true;
+  wakeRecognition.lang = 'en-US';
+  wakeRecognition.maxAlternatives = 3;
+
+  wakeRecognition.onresult = (event) => {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      for (let j = 0; j < event.results[i].length; j++) {
+        const transcript = event.results[i][j].transcript.toLowerCase().trim();
+        if (transcript.includes('hey dude')) {
+          console.log('Wake word detected:', transcript);
+          conversationMode = true;
+          // Stop wake listener, start recording
+          stopWakeWordListener();
+          if (!isRecording && !isBusy && !isPlaying) {
+            startConversationWS();
+          }
+          return;
+        }
+      }
+    }
+  };
+
+  wakeRecognition.onend = () => {
+    // Restart if not recording (Chrome stops after ~60s)
+    if (!isRecording && !isBusy) {
+      setTimeout(() => startWakeWordListener(), 500);
+    }
+  };
+
+  wakeRecognition.onerror = (e) => {
+    if (e.error !== 'no-speech' && e.error !== 'aborted') {
+      console.warn('Wake word error:', e.error);
+    }
+  };
+
+  wakeRecognition.start();
+  console.log('Wake word listener active - say "dude" to start');
+}
+
+function stopWakeWordListener() {
+  if (wakeRecognition) {
+    try { wakeRecognition.abort(); } catch(e) {}
+    wakeRecognition = null;
+  }
+}
+
+// Re-arm wake word after Dude finishes responding
+// Wake word re-arms via mic button only
+
+// Start wake word on page load
+// Wake word starts when mic button is tapped
 
 // ── MATRIX RAIN ──
 function resizeCanvases() {
@@ -928,6 +1197,28 @@ function mainLoop() {
   requestAnimationFrame(mainLoop);
 }
 
+
+// ── WAKE LOCK (prevent screen dimming) ──
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      console.log('Wake lock acquired');
+      wakeLock.addEventListener('release', () => {
+        console.log('Wake lock released');
+      });
+    }
+  } catch (e) {
+    console.warn('Wake lock failed:', e);
+  }
+}
+// Re-acquire on visibility change (iOS releases on tab switch)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') requestWakeLock();
+});
+requestWakeLock();
+
 // ── BOOT ──
 function boot() {
   const lines = [
@@ -945,7 +1236,7 @@ function boot() {
       shown += (shown ? '\n' : '') + lines[idx];
       bootText.textContent = shown;
       idx++;
-      setTimeout(next, 400 + Math.random() * 300);
+      setTimeout(next, 1200 + Math.random() * 600);
     } else {
       setTimeout(() => {
         bootScreen.classList.add('hidden');
@@ -953,7 +1244,7 @@ function boot() {
           bootScreen.style.display = 'none';
           textInput.focus();
         }, 1000);
-      }, 800);
+      }, 2000);
     }
   })();
 }
@@ -973,5 +1264,44 @@ if (idleImg.complete) loaded++;
 if (talkImg.complete) loaded++;
 if (loaded >= 2) { mainLoop(); crtEffects(); updateMouthAnimation(); setTimeout(boot, 400); }
 </script>
+<script src="dude-extras.js" defer>
+    // === Structured Log ===
+    const dudeLog = document.getElementById('dudeLog');
+
+    function addLogEntry(kind, message) {
+      if (!dudeLog) return;
+      dudeLog.style.display = 'block';
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      if (kind === 'input') {
+        entry.innerHTML = '<span class="log-input">&gt; ' + escapeHtml(message) + '</span>';
+      } else if (kind === 'action') {
+        entry.innerHTML = '<span class="log-action">' + escapeHtml(message) + '</span>';
+      } else if (kind === 'result') {
+        entry.innerHTML = '<span class="log-result">' + escapeHtml(message) + '</span>';
+      }
+      dudeLog.appendChild(entry);
+      dudeLog.scrollTop = dudeLog.scrollHeight;
+      // Auto-hide after 30s of no new entries
+      clearTimeout(dudeLog._hideTimer);
+      dudeLog._hideTimer = setTimeout(() => { dudeLog.style.display = 'none'; }, 30000);
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function clearLog() {
+      if (dudeLog) { dudeLog.innerHTML = ''; dudeLog.style.display = 'none'; }
+    }
+
+  
+    // Auto-sync memory from rat on page load
+    fetch('/api/sync').then(r => r.json()).then(d => {
+      console.log('Memory sync:', d.status, d.message);
+    }).catch(() => {});
+</script>  <div id="dudeLog"></div>
 </body>
 </html>

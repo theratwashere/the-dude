@@ -1,76 +1,53 @@
-"""Async audio generation (TTS) via LLM API. Copy into your project and call from FastAPI handlers.
+"""Local TTS via Kokoro. High-quality neural voice synthesis.
 
 Usage:
-    from generate_audio import generate_audio, generate_dialogue
-
-    audio_bytes = await generate_audio("Hello world", voice="kore")
-    audio_bytes = await generate_dialogue([
-        {"speaker": "kore", "text": "Welcome!"},
-        {"speaker": "charon", "text": "Thanks for having me."},
-    ])
+    from generate_audio import generate_audio
+    audio_bytes = await generate_audio("Hello world")
 """
 
-import base64
+import asyncio
+import io
+import logging
+import wave
 
-from pplx.python.sdks.llm_api import (
-    AudioGenParams,
-    Client,
-    Conversation,
-    DialogueInput,
-    Identity,
-    LLMAPIClient,
-    MediaGenParams,
-    SamplingParams,
-)
+log = logging.getLogger("the-dude.tts")
 
-TTS_OUTPUT_FORMAT = "mp3_44100_128"
+# Lazy-loaded Kokoro pipeline
+_pipe = None
+VOICE = "am_echo"
+
+
+def _get_pipe():
+    global _pipe
+    if _pipe is None:
+        from kokoro import KPipeline
+        log.info("Loading Kokoro TTS pipeline...")
+        _pipe = KPipeline(lang_code="a", repo_id="hexgrad/Kokoro-82M")
+        log.info(f"Kokoro ready, voice={VOICE}")
+    return _pipe
+
+
+def _synthesize_sync(text: str) -> bytes:
+    """Generate speech with Kokoro and return WAV bytes."""
+    import soundfile as sf
+    pipe = _get_pipe()
+
+    buf = io.BytesIO()
+    for gs, ps, audio in pipe(text, voice=VOICE):
+        sf.write(buf, audio, 24000, format="WAV", subtype="PCM_16")
+        break  # First chunk contains full audio for short text
+
+    return buf.getvalue()
 
 
 async def generate_audio(
     text: str,
     *,
-    voice: str = "kore",
-    model: str = "gemini_2_5_pro_tts",
+    voice: str = "am_echo",
+    model: str = "kokoro",
 ) -> bytes:
-    client = LLMAPIClient()
-    convo = Conversation()
-    convo.set_single_audio_prompt(text)
-
-    result = await client.messages.create(
-        model=model,
-        convo=convo,
-        identity=Identity(client=Client.ASI, use_case="webserver_audio_gen"),
-        sampling_params=SamplingParams(max_tokens=1),
-        media_gen_params=MediaGenParams(
-            audio=AudioGenParams(voice=voice, output_format=TTS_OUTPUT_FORMAT),
-        ),
-    )
-
-    if not result.audios:
-        raise RuntimeError("No audio generated")
-    return base64.b64decode(result.audios[0].b64_data)
-
-
-async def generate_dialogue(
-    dialogue: list[dict],
-    *,
-    model: str = "gemini_2_5_pro_tts",
-) -> bytes:
-    client = LLMAPIClient()
-    inputs = [DialogueInput(voice=d["speaker"], text=d["text"]) for d in dialogue]
-    convo = Conversation()
-    convo.set_dialogue_prompt(inputs)
-
-    result = await client.messages.create(
-        model=model,
-        convo=convo,
-        identity=Identity(client=Client.ASI, use_case="webserver_audio_gen"),
-        sampling_params=SamplingParams(max_tokens=1),
-        media_gen_params=MediaGenParams(
-            audio=AudioGenParams(output_format=TTS_OUTPUT_FORMAT, dialogue_inputs=inputs),
-        ),
-    )
-
-    if not result.audios:
-        raise RuntimeError("No audio generated")
-    return base64.b64decode(result.audios[0].b64_data)
+    """Generate speech audio from text using local Kokoro TTS.
+    Returns WAV bytes.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _synthesize_sync, text)
