@@ -444,6 +444,93 @@ async def client_error(request: Request):
     return {"ok": True}
 
 
+# ── NOTIFICATION QUEUE ──
+_notify_queue: list = []
+
+
+class NotifyRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=500)
+    hold_ms: int = Field(default=2500, ge=500, le=30000)
+
+
+@app.post("/api/notify")
+async def notify(req: NotifyRequest):
+    """Queue a rain notification for the UI."""
+    _notify_queue.append({"text": req.text, "hold_ms": req.hold_ms})
+    log.info(f"Notification queued: {req.text[:60]}")
+    return {"ok": True}
+
+
+@app.get("/api/notifications")
+async def get_notifications():
+    """Frontend polls this to pick up queued notifications."""
+    if not _notify_queue:
+        return {"notifications": []}
+    batch = list(_notify_queue)
+    _notify_queue.clear()
+    return {"notifications": batch}
+
+
+# ── SPOTIFY NOW PLAYING ──
+_spotify_token = {"access_token": "", "expires_at": 0}
+_SPOTIFY_CLIENT_ID = "747f2db203894b13b609fe798bde1341"
+_SPOTIFY_CLIENT_SECRET = "8373fe185b1c46ad8886e13fc2cebc8e"
+_SPOTIFY_REFRESH_TOKEN = "AQB89Y803FZxxPV0T63k7Q3lsnkVK6eern8xP1Xl-gxQd0jIaLJjyKt2SpRQuOl2b0GL971eJYPxcrdypNBvc4gaXnRy6ZLU-d6D_RGxKycXiY6eKKAefh_dCqQ0J6NmCqU"
+
+
+async def _spotify_ensure_token():
+    """Refresh Spotify access token if expired."""
+    import aiohttp
+    if time.time() < _spotify_token["expires_at"] - 60:
+        return _spotify_token["access_token"]
+    auth = base64.b64encode(f"{_SPOTIFY_CLIENT_ID}:{_SPOTIFY_CLIENT_SECRET}".encode()).decode()
+    async with aiohttp.ClientSession() as s:
+        async with s.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": f"Basic {auth}", "Content-Type": "application/x-www-form-urlencoded"},
+            data=f"grant_type=refresh_token&refresh_token={_SPOTIFY_REFRESH_TOKEN}",
+        ) as r:
+            data = await r.json()
+            _spotify_token["access_token"] = data.get("access_token", "")
+            _spotify_token["expires_at"] = time.time() + data.get("expires_in", 3600)
+            return _spotify_token["access_token"]
+
+
+@app.get("/api/now-playing")
+async def now_playing():
+    """Return current Spotify track info."""
+    try:
+        import aiohttp
+        token = await _spotify_ensure_token()
+        if not token:
+            return {"playing": False}
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://api.spotify.com/v1/me/player",
+                headers={"Authorization": f"Bearer {token}"},
+            ) as r:
+                if r.status == 204 or r.status == 202:
+                    return {"playing": False}
+                if r.status != 200:
+                    return {"playing": False}
+                data = await r.json()
+                item = data.get("item", {})
+                if not item:
+                    return {"playing": False}
+                artists = ", ".join(a["name"] for a in item.get("artists", []))
+                return {
+                    "playing": data.get("is_playing", False),
+                    "track": item.get("name", ""),
+                    "artist": artists,
+                    "album": item.get("album", {}).get("name", ""),
+                    "progress_ms": data.get("progress_ms", 0),
+                    "duration_ms": item.get("duration_ms", 0),
+                }
+    except Exception as e:
+        log.warning("Spotify now-playing error: %s", e)
+        return {"playing": False}
+
+
 @app.get("/api/health")
 async def health():
     return {

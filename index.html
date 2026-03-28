@@ -115,6 +115,11 @@ window.addEventListener('unhandledrejection', function(e) {
     width: 100%; height: 100%;
     z-index: 2; opacity: 0.25; pointer-events: none;
   }
+  #song-canvas {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 6; pointer-events: none;
+  }
   #scanlines {
     position: fixed; top: 0; left: 0;
     width: 100%; height: 100%;
@@ -342,6 +347,7 @@ window.addEventListener('unhandledrejection', function(e) {
   <div id="blink-bar"></div>
 </div>
 <canvas id="rain-overlay"></canvas>
+<canvas id="song-canvas"></canvas>
 <div id="scanlines"></div>
 <div id="vignette"></div>
 <div id="boot-screen"><pre id="boot-text"></pre></div>
@@ -387,6 +393,8 @@ const bgCanvas = document.getElementById('rain-canvas');
 const bgCtx = bgCanvas.getContext('2d');
 const olCanvas = document.getElementById('rain-overlay');
 const olCtx = olCanvas.getContext('2d');
+const songCanvas = document.getElementById('song-canvas');
+const songCtx = songCanvas.getContext('2d');
 const idleImg = document.getElementById('face-idle');
 const talkImg = document.getElementById('face-talk');
 
@@ -2029,13 +2037,14 @@ if (isMobile) {
 }
 function resizeCanvases() {
   if (isMobile) {
-    // Half resolution on mobile to avoid OOM (~12MB vs ~48MB per canvas)
     bgCanvas.width = Math.floor(window.innerWidth / 2);
     bgCanvas.height = Math.floor(window.innerHeight / 2);
   } else {
     bgCanvas.width = olCanvas.width = window.innerWidth;
     bgCanvas.height = olCanvas.height = window.innerHeight;
   }
+  songCanvas.width = window.innerWidth;
+  songCanvas.height = window.innerHeight;
 }
 resizeCanvases();
 window.addEventListener('resize', resizeCanvases);
@@ -2110,6 +2119,85 @@ function updateBreathing() {
 let crtGlitchX = 0;
 function crtEffects() { }
 
+// ── RAIN NOTIFICATIONS (song changes, alerts) ──
+let _textRainChars = [];
+let _lastTrackId = '';
+let SONG_HOLD_MS = 2500;
+
+function rainNotify(text, holdMs) {
+  spawnTextRain(text);
+  if (holdMs !== undefined) SONG_HOLD_MS = holdMs;
+}
+
+function spawnTextRain(text) {
+  const sz = isMobile ? 14 : 18;
+  const chars = text.split('');
+  const cw = songCanvas.width;
+  const ch = songCanvas.height;
+  const landY = ch - 120;
+  const charW = sz * 0.6;
+  const startX = Math.max(10, Math.floor((cw - chars.length * charW) / 2));
+  chars.forEach((c, i) => {
+    _textRainChars.push({
+      char: c, x: startX + i * charW,
+      y: -sz * (2 + Math.random() * 8),
+      landY: landY, speed: 2.5 + Math.random() * 2.0,
+      alpha: 0.7, state: 'falling', landedAt: 0,
+    });
+  });
+}
+
+function drawTextRain() {
+  const ctx = songCtx;
+  ctx.clearRect(0, 0, songCanvas.width, songCanvas.height);
+  if (_textRainChars.length === 0) return;
+  const sz = isMobile ? 14 : 18;
+  const now = performance.now();
+  ctx.font = `bold ${sz}px 'Courier New', monospace`;
+  for (let i = _textRainChars.length - 1; i >= 0; i--) {
+    const c = _textRainChars[i];
+    if (c.state === 'falling') {
+      c.y += c.speed;
+      if (c.y >= c.landY) { c.y = c.landY; c.state = 'landed'; c.landedAt = now; }
+      ctx.fillStyle = `rgba(0,255,65,${c.alpha * 0.8})`;
+      ctx.shadowColor = '#00ff41'; ctx.shadowBlur = 6;
+    } else if (c.state === 'landed') {
+      if (now - c.landedAt > SONG_HOLD_MS) c.state = 'fading';
+      ctx.fillStyle = `rgba(0,255,65,${c.alpha * 0.6})`;
+      ctx.shadowColor = '#00ff41'; ctx.shadowBlur = 4;
+    } else if (c.state === 'fading') {
+      c.alpha -= 0.02;
+      if (c.alpha <= 0) { _textRainChars.splice(i, 1); continue; }
+      ctx.fillStyle = `rgba(0,255,65,${c.alpha * 0.5})`;
+      ctx.shadowBlur = 0;
+    }
+    ctx.fillText(c.char, c.x, c.y);
+    ctx.shadowBlur = 0;
+  }
+}
+
+function startNowPlayingPoll() {
+  setInterval(async () => {
+    try {
+      const r = await fetch(`${API}/api/now-playing`);
+      const d = await r.json();
+      if (!d.playing || !d.track) return;
+      const tid = d.track + '|' + d.artist;
+      if (tid !== _lastTrackId) {
+        _lastTrackId = tid;
+        rainNotify(d.track + '  \u00b7  ' + d.artist);
+      }
+    } catch(e) {}
+  }, 5000);
+  setInterval(async () => {
+    try {
+      const r = await fetch(`${API}/api/notifications`);
+      const d = await r.json();
+      for (const n of (d.notifications || [])) rainNotify(n.text, n.hold_ms);
+    } catch(e) {}
+  }, 2000);
+}
+
 // ── MAIN LOOP ──
 let lastMainFrame = 0;
 function mainLoop(ts) {
@@ -2122,6 +2210,7 @@ function mainLoop(ts) {
   } else {
     if (bgRain) drawRainLayer(bgCtx, bgRain, 0.045);
     if (olRain) drawRainLayer(olCtx, olRain, 0.055);
+    drawTextRain();
     updateBreathing();
   }
   requestAnimationFrame(mainLoop);
@@ -2164,7 +2253,7 @@ let started = false;
 function tryStart() {
   if (started || loaded < 2) return;
   started = true;
-  mainLoop(); crtEffects(); updateMouthAnimation();
+  mainLoop(); crtEffects(); updateMouthAnimation(); startNowPlayingPoll();
   setTimeout(boot, 400);
 }
 function onReady() {
