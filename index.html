@@ -2106,21 +2106,9 @@ function updateBreathing() {
   }
 }
 
-// ── CRT ──
+// ── CRT (disabled) ──
 let crtGlitchX = 0;
-function crtEffects() {
-  if (isMobile) return; // Skip CRT on mobile to save resources
-  const layer = document.getElementById('face-layer');
-  if (Math.random() > 0.97) {
-    layer.style.opacity = String(0.7 + Math.random() * 0.3);
-    setTimeout(() => { layer.style.opacity = '1'; }, 25 + Math.random() * 60);
-  }
-  if (Math.random() > 0.994) {
-    crtGlitchX = (Math.random() - 0.5) * 10;
-    setTimeout(() => { crtGlitchX = 0; }, 35 + Math.random() * 80);
-  }
-  if (!isMobile) requestAnimationFrame(crtEffects);
-}
+function crtEffects() { }
 
 // ── MAIN LOOP ──
 let lastMainFrame = 0;
