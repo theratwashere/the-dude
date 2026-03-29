@@ -489,7 +489,7 @@ async def client_error(request: Request):
 
 _notifications: list = []  # [{id, ts, ...notification data}]
 _notify_counter = 0
-NOTIFY_TTL = 60  # seconds
+NOTIFY_TTL = 600  # 10 minutes — keep notifications available for slow pollers and refreshes
 
 
 class NotifyRequest(BaseModel):

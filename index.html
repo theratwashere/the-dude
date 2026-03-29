@@ -2308,8 +2308,10 @@ function tryStart() {
   if (started || loaded < 2) return;
   started = true;
   resizeCanvases(); // ensure song canvas is sized after DOM is ready
-  mainLoop(); crtEffects(); updateMouthAnimation(); startNowPlayingPoll();
+  mainLoop(); crtEffects(); updateMouthAnimation();
   setTimeout(boot, 400);
+  // Delay notification polling until boot screen finishes (~6s)
+  setTimeout(startNowPlayingPoll, 7000);
 }
 function onReady() {
   loaded++;
