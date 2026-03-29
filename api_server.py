@@ -26,6 +26,14 @@ from pydantic import BaseModel, Field
 
 from comet_bridge import CometBridge
 
+# MQTT bus — graceful degradation if broker not available
+try:
+    from mqtt_bus import DudeMQTT
+    HAS_MQTT = True
+except ImportError:
+    HAS_MQTT = False
+    logging.getLogger("the-dude").warning("MQTT module not found (pip install paho-mqtt)")
+
 # TTS engine — graceful degradation if no engine available
 try:
     from tts_engine import generate_tts, HAS_TTS, get_audio_content_type
@@ -419,6 +427,28 @@ app.add_middleware(
 )
 
 
+# ── MQTT BUS ──
+_mqtt: Optional['DudeMQTT'] = None
+
+def _mqtt_on_notify(payload: dict):
+    """Callback: MQTT message received → push to local notification queue."""
+    _notify_queue.append(payload)
+    log.info("MQTT notification: %s", str(payload.get("text", ""))[:60])
+
+@app.on_event("startup")
+async def startup_mqtt():
+    global _mqtt
+    if HAS_MQTT:
+        dude_name = os.environ.get("DUDE_NAME", "rat")
+        _mqtt = DudeMQTT(name=dude_name, on_notify=_mqtt_on_notify)
+        _mqtt.start()
+
+@app.on_event("shutdown")
+async def shutdown_mqtt():
+    if _mqtt:
+        _mqtt.stop()
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_LEN)
 
@@ -443,12 +473,6 @@ async def client_error(request: Request):
         log.error("CLIENT ERROR (unparseable body)")
     return {"ok": True}
 
-
-# ── FLEET ──
-FLEET_DUDES = [
-    ("rat", "http://100.77.205.27:8000"),
-    # ("thor", "http://100.92.32.127:8000"),
-]
 
 # ── NOTIFICATION QUEUE ──
 _notify_queue: list = []
@@ -483,35 +507,18 @@ async def get_notifications():
     return {"notifications": batch}
 
 
-async def _notify_member(name: str, url: str, req: NotifyRequest):
-    """POST notification to a fleet member. Returns name on success."""
-    import aiohttp
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{url}/api/notify",
-                json=req.dict(),
-                timeout=aiohttp.ClientTimeout(total=3),
-            ) as r:
-                if r.status == 200:
-                    log.info(f"Broadcast delivered to {name}")
-                    return name
-                log.warning(f"Broadcast to {name}: HTTP {r.status}")
-                return name
-    except Exception as e:
-        log.warning(f"Broadcast to {name} failed: {e}")
-        raise
-
-
 @app.post("/api/broadcast")
 async def broadcast(req: NotifyRequest):
-    """Send notification to ALL fleet Dude instances."""
-    tasks = [_notify_member(name, url, req) for name, url in FLEET_DUDES]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    delivered = sum(1 for r in results if not isinstance(r, Exception))
-    failed = sum(1 for r in results if isinstance(r, Exception))
-    log.info(f"Broadcast '{req.text[:40]}': {delivered} delivered, {failed} failed")
-    return {"ok": True, "delivered": delivered, "failed": failed}
+    """Broadcast notification to ALL fleet Dude instances via MQTT."""
+    if _mqtt and _mqtt.connected:
+        _mqtt.broadcast(req.text, **{k: v for k, v in req.dict().items() if k != "text"})
+        log.info(f"MQTT broadcast: {req.text[:60]}")
+        return {"ok": True, "via": "mqtt"}
+    else:
+        # Fallback: just local queue
+        _notify_queue.append(req.dict())
+        log.warning("MQTT not connected, broadcast went to local queue only")
+        return {"ok": True, "via": "local"}
 
 
 # ── SPOTIFY NOW PLAYING ──

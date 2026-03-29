@@ -2131,7 +2131,7 @@ function showNotify(opts) {
     color: opts.color || '#00ff41',
     size: opts.size || (isMobile ? 14 : 18),
     position: opts.position || 'center',
-    bg: opts.bg !== false,
+    bg: opts.bg === true,  // off by default, opt-in
     bg_opacity: opts.bg_opacity || 0.75,
     source: opts.source || '',
   });
