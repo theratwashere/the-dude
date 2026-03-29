@@ -431,9 +431,17 @@ app.add_middleware(
 _mqtt: Optional['DudeMQTT'] = None
 
 def _mqtt_on_notify(payload: dict):
-    """Callback: MQTT message received → push to local notification queue."""
-    _notify_queue.append(payload)
-    log.info("MQTT notification: %s", str(payload.get("text", ""))[:60])
+    """Callback: MQTT message received → push to notification system."""
+    global _notify_counter
+    _notify_counter += 1
+    entry = dict(payload)
+    entry["id"] = _notify_counter
+    entry["ts"] = time.time()
+    if "duration" not in entry:
+        entry["duration"] = 5000
+    _notifications.append(entry)
+    _prune_old_notifications()
+    log.info("MQTT notification #%d: %s", _notify_counter, str(payload.get("text", ""))[:60])
 
 @app.on_event("startup")
 async def startup_mqtt():
@@ -474,8 +482,14 @@ async def client_error(request: Request):
     return {"ok": True}
 
 
-# ── NOTIFICATION QUEUE ──
-_notify_queue: list = []
+# ── NOTIFICATION SYSTEM (per-client queues) ──
+# Notifications are stored with an incrementing ID.
+# Each client tracks its last-seen ID via query param.
+# Notifications expire after 60s to prevent unbounded growth.
+
+_notifications: list = []  # [{id, ts, ...notification data}]
+_notify_counter = 0
+NOTIFY_TTL = 60  # seconds
 
 
 class NotifyRequest(BaseModel):
@@ -484,27 +498,39 @@ class NotifyRequest(BaseModel):
     color: str = Field(default="#00ff41")
     size: int = Field(default=18)
     position: str = Field(default="center")  # top, center, bottom
-    bg: bool = Field(default=True)
+    bg: bool = Field(default=False)
     bg_opacity: float = Field(default=0.75)
     source: str = Field(default="")
 
 
+def _prune_old_notifications():
+    """Remove notifications older than TTL."""
+    cutoff = time.time() - NOTIFY_TTL
+    while _notifications and _notifications[0]["ts"] < cutoff:
+        _notifications.pop(0)
+
+
 @app.post("/api/notify")
 async def notify(req: NotifyRequest):
-    """Queue a notification for the UI."""
-    _notify_queue.append(req.dict())
-    log.info(f"Notification queued: {req.text[:60]}")
-    return {"ok": True}
+    """Queue a notification for all clients."""
+    global _notify_counter
+    _notify_counter += 1
+    entry = req.dict()
+    entry["id"] = _notify_counter
+    entry["ts"] = time.time()
+    _notifications.append(entry)
+    _prune_old_notifications()
+    log.info(f"Notification #{_notify_counter}: {req.text[:60]}")
+    return {"ok": True, "id": _notify_counter}
 
 
 @app.get("/api/notifications")
-async def get_notifications():
-    """Frontend polls this to pick up queued notifications."""
-    if not _notify_queue:
-        return {"notifications": []}
-    batch = list(_notify_queue)
-    _notify_queue.clear()
-    return {"notifications": batch}
+async def get_notifications(since: int = 0):
+    """Get notifications newer than `since` ID. Each client tracks its own cursor."""
+    _prune_old_notifications()
+    new = [n for n in _notifications if n["id"] > since]
+    last_id = _notifications[-1]["id"] if _notifications else since
+    return {"notifications": new, "last_id": last_id}
 
 
 @app.post("/api/broadcast")

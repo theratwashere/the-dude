@@ -2130,7 +2130,7 @@ function showNotify(opts) {
     duration: opts.duration || 5000,
     color: opts.color || '#00ff41',
     size: opts.size || (isMobile ? 14 : 18),
-    position: opts.position || 'center',
+    position: opts.position || 'bottom',
     bg: opts.bg === true,  // off by default, opt-in
     bg_opacity: opts.bg_opacity || 0.75,
     source: opts.source || '',
@@ -2200,12 +2200,20 @@ function drawNotify() {
     ctx.fillRect((W - bgW) / 2, yCenter - blockH / 2 - 12, bgW, blockH + 24);
   }
 
-  // Text
+  // Text with dark outline for visibility against green face
   ctx.globalAlpha = opacity;
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 4;
+  ctx.lineJoin = 'round';
   ctx.fillStyle = n.color;
+  ctx.shadowColor = '#000';
+  ctx.shadowBlur = 8;
   lines.forEach((line, i) => {
-    ctx.fillText(line, W / 2, startY + i * lineH);
+    const y = startY + i * lineH;
+    ctx.strokeText(line, W / 2, y);
+    ctx.fillText(line, W / 2, y);
   });
+  ctx.shadowBlur = 0;
 
   // Source tag (small, dimmer, below text)
   if (n.source) {
@@ -2232,11 +2240,13 @@ function startNowPlayingPoll() {
     } catch(e) {}
   }, 5000);
 
-  // General notifications
+  // General notifications (per-client cursor via since= param)
+  let _lastNotifyId = 0;
   setInterval(async () => {
     try {
-      const r = await fetch(`${API}/api/notifications`);
+      const r = await fetch(`${API}/api/notifications?since=${_lastNotifyId}`);
       const d = await r.json();
+      if (d.last_id) _lastNotifyId = d.last_id;
       for (const n of (d.notifications || [])) showNotify(n);
     } catch(e) {}
   }, 2000);
@@ -2297,6 +2307,7 @@ let started = false;
 function tryStart() {
   if (started || loaded < 2) return;
   started = true;
+  resizeCanvases(); // ensure song canvas is sized after DOM is ready
   mainLoop(); crtEffects(); updateMouthAnimation(); startNowPlayingPoll();
   setTimeout(boot, 400);
 }
