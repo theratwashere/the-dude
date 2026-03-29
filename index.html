@@ -2119,64 +2119,106 @@ function updateBreathing() {
 let crtGlitchX = 0;
 function crtEffects() { }
 
-// ── RAIN NOTIFICATIONS (song changes, alerts) ──
-let _textRainChars = [];
+// ── NOTIFICATIONS (Car Thing-style centered overlay) ──
+let _notifyQueue = [];  // pending notifications
+let _activeNotify = null; // {text, duration, color, size, position, bg, bg_opacity, startedAt}
 let _lastTrackId = '';
-let SONG_HOLD_MS = 2500;
 
-function rainNotify(text, holdMs) {
-  spawnTextRain(text);
-  if (holdMs !== undefined) SONG_HOLD_MS = holdMs;
-}
-
-function spawnTextRain(text) {
-  const sz = isMobile ? 14 : 18;
-  const chars = text.split('');
-  const cw = songCanvas.width;
-  const ch = songCanvas.height;
-  const landY = ch - 120;
-  const charW = sz * 0.6;
-  const startX = Math.max(10, Math.floor((cw - chars.length * charW) / 2));
-  chars.forEach((c, i) => {
-    _textRainChars.push({
-      char: c, x: startX + i * charW,
-      y: -sz * (2 + Math.random() * 8),
-      landY: landY, speed: 2.5 + Math.random() * 2.0,
-      alpha: 0.7, state: 'falling', landedAt: 0,
-    });
+function showNotify(opts) {
+  _notifyQueue.push({
+    text: opts.text || '',
+    duration: opts.duration || 5000,
+    color: opts.color || '#00ff41',
+    size: opts.size || (isMobile ? 14 : 18),
+    position: opts.position || 'center',
+    bg: opts.bg !== false,
+    bg_opacity: opts.bg_opacity || 0.75,
+    source: opts.source || '',
   });
 }
 
-function drawTextRain() {
+function drawNotify() {
   const ctx = songCtx;
-  ctx.clearRect(0, 0, songCanvas.width, songCanvas.height);
-  if (_textRainChars.length === 0) return;
-  const sz = isMobile ? 14 : 18;
-  const now = performance.now();
-  ctx.font = `bold ${sz}px 'Courier New', monospace`;
-  for (let i = _textRainChars.length - 1; i >= 0; i--) {
-    const c = _textRainChars[i];
-    if (c.state === 'falling') {
-      c.y += c.speed;
-      if (c.y >= c.landY) { c.y = c.landY; c.state = 'landed'; c.landedAt = now; }
-      ctx.fillStyle = `rgba(0,255,65,${c.alpha * 0.8})`;
-      ctx.shadowColor = '#00ff41'; ctx.shadowBlur = 6;
-    } else if (c.state === 'landed') {
-      if (now - c.landedAt > SONG_HOLD_MS) c.state = 'fading';
-      ctx.fillStyle = `rgba(0,255,65,${c.alpha * 0.6})`;
-      ctx.shadowColor = '#00ff41'; ctx.shadowBlur = 4;
-    } else if (c.state === 'fading') {
-      c.alpha -= 0.02;
-      if (c.alpha <= 0) { _textRainChars.splice(i, 1); continue; }
-      ctx.fillStyle = `rgba(0,255,65,${c.alpha * 0.5})`;
-      ctx.shadowBlur = 0;
-    }
-    ctx.fillText(c.char, c.x, c.y);
-    ctx.shadowBlur = 0;
+  const W = songCanvas.width;
+  const H = songCanvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Promote next in queue if nothing active
+  if (!_activeNotify && _notifyQueue.length > 0) {
+    _activeNotify = _notifyQueue.shift();
+    _activeNotify.startedAt = performance.now();
   }
+  if (!_activeNotify) return;
+
+  const n = _activeNotify;
+  const elapsed = performance.now() - n.startedAt;
+  const fadeInMs = 300;
+  const fadeOutMs = 1000;
+  const totalMs = n.duration + fadeOutMs;
+
+  // Done — clear and let next one in
+  if (elapsed > totalMs) {
+    _activeNotify = null;
+    return;
+  }
+
+  // Opacity: fade in, hold, fade out
+  const fadeIn = Math.min(1, elapsed / fadeInMs);
+  const fadeOut = Math.max(0, 1 - Math.max(0, elapsed - n.duration) / fadeOutMs);
+  const opacity = fadeIn * fadeOut;
+
+  // Position
+  let yCenter;
+  if (n.position === 'top') yCenter = H * 0.15;
+  else if (n.position === 'bottom') yCenter = H * 0.82;
+  else yCenter = H * 0.45;
+
+  ctx.save();
+  ctx.font = `bold ${n.size}px 'Courier New', monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // Word wrap
+  const maxWidth = W * 0.85;
+  const words = n.text.split(' ');
+  const lines = [''];
+  for (const word of words) {
+    const test = lines[lines.length - 1] + (lines[lines.length - 1] ? ' ' : '') + word;
+    if (ctx.measureText(test).width > maxWidth) lines.push(word);
+    else lines[lines.length - 1] = test;
+  }
+
+  const lineH = n.size * 1.4;
+  const blockH = lines.length * lineH;
+  const startY = yCenter - blockH / 2 + lineH / 2;
+
+  // Background bar
+  if (n.bg) {
+    const bgW = Math.min(maxWidth + 40, W * 0.9);
+    ctx.globalAlpha = opacity * n.bg_opacity;
+    ctx.fillStyle = '#000';
+    ctx.fillRect((W - bgW) / 2, yCenter - blockH / 2 - 12, bgW, blockH + 24);
+  }
+
+  // Text
+  ctx.globalAlpha = opacity;
+  ctx.fillStyle = n.color;
+  lines.forEach((line, i) => {
+    ctx.fillText(line, W / 2, startY + i * lineH);
+  });
+
+  // Source tag (small, dimmer, below text)
+  if (n.source) {
+    ctx.globalAlpha = opacity * 0.4;
+    ctx.font = `${Math.floor(n.size * 0.6)}px 'Courier New', monospace`;
+    ctx.fillText('— ' + n.source, W / 2, startY + lines.length * lineH + 8);
+  }
+
+  ctx.restore();
 }
 
 function startNowPlayingPoll() {
+  // Spotify track changes
   setInterval(async () => {
     try {
       const r = await fetch(`${API}/api/now-playing`);
@@ -2185,15 +2227,17 @@ function startNowPlayingPoll() {
       const tid = d.track + '|' + d.artist;
       if (tid !== _lastTrackId) {
         _lastTrackId = tid;
-        rainNotify(d.track + '  \u00b7  ' + d.artist);
+        showNotify({ text: d.track + '  \u00b7  ' + d.artist, position: 'bottom', duration: 4000, size: isMobile ? 12 : 16 });
       }
     } catch(e) {}
   }, 5000);
+
+  // General notifications
   setInterval(async () => {
     try {
       const r = await fetch(`${API}/api/notifications`);
       const d = await r.json();
-      for (const n of (d.notifications || [])) rainNotify(n.text, n.hold_ms);
+      for (const n of (d.notifications || [])) showNotify(n);
     } catch(e) {}
   }, 2000);
 }
@@ -2210,7 +2254,7 @@ function mainLoop(ts) {
   } else {
     if (bgRain) drawRainLayer(bgCtx, bgRain, 0.045);
     if (olRain) drawRainLayer(olCtx, olRain, 0.055);
-    drawTextRain();
+    drawNotify();
     updateBreathing();
   }
   requestAnimationFrame(mainLoop);

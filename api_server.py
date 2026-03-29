@@ -444,19 +444,31 @@ async def client_error(request: Request):
     return {"ok": True}
 
 
+# ── FLEET ──
+FLEET_DUDES = [
+    ("rat", "http://100.77.205.27:8000"),
+    # ("thor", "http://100.92.32.127:8000"),
+]
+
 # ── NOTIFICATION QUEUE ──
 _notify_queue: list = []
 
 
 class NotifyRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=500)
-    hold_ms: int = Field(default=2500, ge=500, le=30000)
+    duration: int = Field(default=5000, ge=500, le=60000)
+    color: str = Field(default="#00ff41")
+    size: int = Field(default=18)
+    position: str = Field(default="center")  # top, center, bottom
+    bg: bool = Field(default=True)
+    bg_opacity: float = Field(default=0.75)
+    source: str = Field(default="")
 
 
 @app.post("/api/notify")
 async def notify(req: NotifyRequest):
-    """Queue a rain notification for the UI."""
-    _notify_queue.append({"text": req.text, "hold_ms": req.hold_ms})
+    """Queue a notification for the UI."""
+    _notify_queue.append(req.dict())
     log.info(f"Notification queued: {req.text[:60]}")
     return {"ok": True}
 
@@ -469,6 +481,37 @@ async def get_notifications():
     batch = list(_notify_queue)
     _notify_queue.clear()
     return {"notifications": batch}
+
+
+async def _notify_member(name: str, url: str, req: NotifyRequest):
+    """POST notification to a fleet member. Returns name on success."""
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{url}/api/notify",
+                json=req.dict(),
+                timeout=aiohttp.ClientTimeout(total=3),
+            ) as r:
+                if r.status == 200:
+                    log.info(f"Broadcast delivered to {name}")
+                    return name
+                log.warning(f"Broadcast to {name}: HTTP {r.status}")
+                return name
+    except Exception as e:
+        log.warning(f"Broadcast to {name} failed: {e}")
+        raise
+
+
+@app.post("/api/broadcast")
+async def broadcast(req: NotifyRequest):
+    """Send notification to ALL fleet Dude instances."""
+    tasks = [_notify_member(name, url, req) for name, url in FLEET_DUDES]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    delivered = sum(1 for r in results if not isinstance(r, Exception))
+    failed = sum(1 for r in results if isinstance(r, Exception))
+    log.info(f"Broadcast '{req.text[:40]}': {delivered} delivered, {failed} failed")
+    return {"ok": True, "delivered": delivered, "failed": failed}
 
 
 # ── SPOTIFY NOW PLAYING ──
