@@ -40,11 +40,12 @@
     display: flex; align-items: center; justify-content: center;
     z-index: 1;
     opacity: 0;
-    transition: opacity 3s ease;
+    transition: opacity 10s ease;
   }
   #face-layer img {
     height: 100vh; width: 100vw;
     object-fit: contain;
+    mix-blend-mode: screen;
     filter: drop-shadow(0 0 30px rgba(0,255,65,0.25)) drop-shadow(0 0 60px rgba(0,255,65,0.1));
   }
   #face-idle { opacity: 1; position: absolute; }
@@ -177,7 +178,7 @@
     width: 100%; height: 100%;
     display: flex; align-items: center; justify-content: center;
     z-index: 50;
-    background: rgba(0,0,0,0.97);
+    background: rgba(0,0,0,0.82);
     transition: opacity 1s ease;
   }
   #boot-screen.hidden { opacity: 0; pointer-events: none; }
@@ -1240,7 +1241,6 @@ function boot() {
       setTimeout(next, 1200 + Math.random() * 600);
     } else {
       setTimeout(() => {
-        faceLayer.style.opacity = '1';
         bootScreen.classList.add('hidden');
         setTimeout(() => {
           bootScreen.style.display = 'none';
@@ -1256,6 +1256,7 @@ let loaded = 0;
 function onReady() {
   loaded++;
   if (loaded >= 2) {
+    faceLayer.style.opacity = '1';
     mainLoop(); crtEffects(); updateMouthAnimation();
     setTimeout(boot, 400);
   }
@@ -1264,7 +1265,8 @@ idleImg.onload = onReady;
 talkImg.onload = onReady;
 if (idleImg.complete) loaded++;
 if (talkImg.complete) loaded++;
-if (loaded >= 2) { mainLoop(); crtEffects(); updateMouthAnimation(); setTimeout(boot, 400); }
+if (loaded >= 2) {
+    faceLayer.style.opacity = '1'; mainLoop(); crtEffects(); updateMouthAnimation(); setTimeout(boot, 400); }
 </script>
 <script src="dude-extras.js" defer>
     // === Structured Log ===
