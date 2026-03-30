@@ -272,7 +272,8 @@ const olCtx = olCanvas.getContext('2d');
 const idleImg = document.getElementById('face-idle');
 const talkImg = document.getElementById('face-talk');
 
-const bootScreen = document.getElementById('boot-screen');
+const faceLayer = document.getElementById("face-layer");
+const bootScreen = document.getElementById("boot-screen");
 const bootText = document.getElementById('boot-text');
 const textInput = document.getElementById('text-input');
 const sendBtn = document.getElementById('send-btn');
@@ -1239,6 +1240,7 @@ function boot() {
       setTimeout(next, 1200 + Math.random() * 600);
     } else {
       setTimeout(() => {
+        faceLayer.style.opacity = '1';
         bootScreen.classList.add('hidden');
         setTimeout(() => {
           bootScreen.style.display = 'none';
