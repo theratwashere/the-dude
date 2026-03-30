@@ -1,55 +1,39 @@
-"""Local STT via faster-whisper. Drop-in replacement for the cloud STT module.
+"""Async audio transcription via LLM API. Copy into your project and call from FastAPI handlers.
 
 Usage:
     from transcribe_audio import transcribe_audio
-    result = await transcribe_audio(audio_bytes, media_type="audio/webm")
+
+    result = await transcribe_audio(audio_bytes, media_type="audio/mpeg")
     print(result["text"])
+
+    result = await transcribe_audio(audio_bytes, media_type="audio/mpeg", diarize=True, timestamps="word")
+    for word in result["words"]:
+        print(f"[Speaker {word['speaker_id']}] {word['text']} ({word['start']}-{word['end']})")
 """
 
-import asyncio
-import io
-import logging
-import tempfile
+import base64
 
-log = logging.getLogger("the-dude.stt")
-
-# Lazy-loaded model
-_model = None
-
-
-def _get_model():
-    global _model
-    if _model is None:
-        from faster_whisper import WhisperModel
-        log.info("Loading Whisper model (base)...")
-        # Use CUDA if available, fall back to CPU
-        try:
-            _model = WhisperModel("base", device="cuda", compute_type="float16")
-            log.info("Whisper model loaded (CUDA float16)")
-        except Exception:
-            _model = WhisperModel("base", device="cpu", compute_type="int8")
-            log.info("Whisper model loaded (CPU int8)")
-    return _model
+from pplx.python.sdks.llm_api import (
+    AudioBlock,
+    AudioSource,
+    Client,
+    Conversation,
+    Identity,
+    LLMAPIClient,
+    MediaGenParams,
+    SamplingParams,
+    SpeechToTextParams,
+)
 
 
-def _transcribe_sync(audio_bytes: bytes, media_type: str) -> dict:
-    """Transcribe audio bytes using faster-whisper."""
-    model = _get_model()
+_client: LLMAPIClient | None = None
 
-    # Write audio to temp file (faster-whisper needs a file path)
-    suffix = ".webm" if "webm" in media_type else ".wav" if "wav" in media_type else ".mp3"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as f:
-        f.write(audio_bytes)
-        f.flush()
 
-        segments, info = model.transcribe(f.name, beam_size=5, vad_filter=True)
-        text = " ".join(seg.text.strip() for seg in segments)
-
-    return {
-        "text": text,
-        "language_code": info.language,
-        "words": [],
-    }
+def _get_client() -> LLMAPIClient:
+    global _client
+    if _client is None:
+        _client = LLMAPIClient()
+    return _client
 
 
 async def transcribe_audio(
@@ -60,10 +44,36 @@ async def transcribe_audio(
     diarize: bool = False,
     num_speakers: int | None = None,
     language: str | None = None,
-    model: str = "whisper-base",
+    model: str = "elevenlabs_scribe_v2",
 ) -> dict:
-    """Transcribe audio using local faster-whisper.
-    Returns dict with 'text', 'language_code', 'words' keys.
-    """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _transcribe_sync, audio_bytes, media_type)
+    if not audio_bytes:
+        raise ValueError("Cannot transcribe empty audio")
+    client = _get_client()
+    b64 = base64.b64encode(audio_bytes).decode()
+    convo = Conversation()
+    convo.add_user(AudioBlock(source=AudioSource(media_type=media_type, data=b64)))
+
+    result = await client.messages.create(
+        model=model,
+        convo=convo,
+        identity=Identity(client=Client.ASI, use_case="webserver_transcription"),
+        sampling_params=SamplingParams(max_tokens=1),
+        media_gen_params=MediaGenParams(
+            speech_to_text=SpeechToTextParams(
+                diarize=diarize,
+                num_speakers=num_speakers,
+                timestamps_granularity=timestamps,
+                language_code=language,
+            ),
+        ),
+    )
+
+    if not result.transcriptions:
+        raise RuntimeError("No transcription generated")
+
+    t = result.transcriptions[0]
+    return {
+        "text": t.text,
+        "language_code": t.language_code,
+        "words": [{"text": w.text, "start": w.start, "end": w.end, "speaker_id": w.speaker_id} for w in t.words],
+    }
