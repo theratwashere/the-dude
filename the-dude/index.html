@@ -1,0 +1,1315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!--
+   ______                            __
+  / ____/___  ____ ___  ____  __  __/ /____  _____
+ / /   / __ \/ __ `__ \/ __ \/ / / / __/ _ \/ ___/
+/ /___/ /_/ / / / / / / /_/ / /_/ / /_/  __/ /
+\____/\____/_/ /_/ /_/ .___/\__,_/\__/\___/_/
+                    /_/
+        Created with Perplexity Computer
+        https://www.perplexity.ai/computer
+-->
+
+<meta name="generator" content="Perplexity Computer">
+<meta name="author" content="Perplexity Computer">
+<meta property="og:see_also" content="https://www.perplexity.ai/computer">
+<link rel="author" href="https://www.perplexity.ai/computer">
+
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>The Dude</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #000;
+    font-family: 'Courier New', monospace;
+  }
+
+  #rain-canvas {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 0;
+  }
+  #face-layer {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    z-index: 1;
+    opacity: 0;
+    transition: opacity 3s ease;
+  }
+  #face-layer img {
+    height: 100vh; width: 100vw;
+    object-fit: contain;
+    filter: drop-shadow(0 0 30px rgba(0,255,65,0.25)) drop-shadow(0 0 60px rgba(0,255,65,0.1));
+  }
+  #face-idle { opacity: 1; position: absolute; }
+  #face-talk { opacity: 0; position: absolute; pointer-events: none; will-change: opacity, transform; }
+
+  #rain-overlay {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    z-index: 2; opacity: 0.25; pointer-events: none;
+  }
+  #scanlines {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,0,0,0.07) 2px, rgba(0,0,0,0.07) 4px);
+    pointer-events: none; z-index: 3;
+  }
+  #vignette {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: radial-gradient(ellipse at center, transparent 35%, rgba(0,0,0,0.7) 100%);
+    pointer-events: none; z-index: 4;
+  }
+
+  /* ── CONVERSATION UI ── */
+  #chat-ui {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    z-index: 10;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 0 16px 20px;
+    pointer-events: none;
+  }
+
+  #dude-text {
+    font-family: 'Courier New', monospace;
+    font-size: clamp(13px, 2.5vw, 16px);
+    color: #00ff41;
+    text-shadow: 0 0 6px rgba(0,255,65,0.5);
+    text-align: center;
+    max-width: 520px;
+    min-height: 22px;
+    margin-bottom: 12px;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+    line-height: 1.5;
+  }
+  #dude-text.visible { opacity: 1; }
+
+  #status-indicator {
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    color: rgba(0,255,65,0.6);
+    text-shadow: 0 0 4px rgba(0,255,65,0.3);
+    margin-bottom: 8px;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    text-align: center;
+  }
+  #status-indicator.visible { opacity: 1; }
+
+  #input-row {
+    display: flex; align-items: center; gap: 8px;
+    width: 100%; max-width: 500px;
+    pointer-events: auto;
+  }
+
+  #text-input {
+    flex: 1;
+    background: rgba(0,20,0,0.75);
+    border: 1px solid rgba(0,255,65,0.3);
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    color: #00ff41;
+    outline: none;
+    caret-color: #00ff41;
+    backdrop-filter: blur(8px);
+  }
+  #text-input::placeholder { color: rgba(0,255,65,0.3); }
+  #text-input:focus {
+    border-color: rgba(0,255,65,0.6);
+    box-shadow: 0 0 12px rgba(0,255,65,0.15);
+  }
+
+  .btn {
+    width: 42px; height: 42px;
+    border-radius: 50%;
+    border: 1px solid rgba(0,255,65,0.3);
+    background: rgba(0,20,0,0.75);
+    color: #00ff41;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    backdrop-filter: blur(8px);
+    flex-shrink: 0;
+  }
+  .btn:hover {
+    border-color: rgba(0,255,65,0.6);
+    box-shadow: 0 0 12px rgba(0,255,65,0.2);
+  }
+  .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .btn svg {
+    width: 18px; height: 18px;
+    fill: none; stroke: currentColor;
+    stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+  }
+
+  #mic-btn.recording {
+    border-color: #ff3333;
+    background: rgba(60,0,0,0.75);
+    color: #ff3333;
+    box-shadow: 0 0 16px rgba(255,50,50,0.3);
+    animation: pulse-red 1.2s infinite;
+  }
+  @keyframes pulse-red {
+    0%, 100% { box-shadow: 0 0 16px rgba(255,50,50,0.3); }
+    50% { box-shadow: 0 0 24px rgba(255,50,50,0.5); }
+  }
+
+  @keyframes blink {
+    0%, 80%, 100% { opacity: 0.2; }
+    40% { opacity: 1; }
+  }
+  .thinking-dots span { animation: blink 1.4s infinite both; }
+  .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+  .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+  #boot-screen {
+    position: fixed; top: 0; left: 0;
+    width: 100%; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    z-index: 50;
+    background: rgba(0,0,0,0.97);
+    transition: opacity 1s ease;
+  }
+  #boot-screen.hidden { opacity: 0; pointer-events: none; }
+  #boot-text {
+    font-family: 'Courier New', monospace;
+    font-size: clamp(14px, 4.5vw, 28px);
+    color: #00ff41; text-shadow: 0 0 8px #00ff41;
+    white-space: pre; line-height: 1.8; padding: 20px;
+  }
+
+  footer { position: fixed; bottom: 4px; right: 6px; z-index: 20; }
+  footer a {
+    font-family: 'Courier New', monospace;
+    font-size: 8px; color: rgba(0,255,65,0.12); text-decoration: none;
+  }
+
+  #dudeLog {
+    position: fixed;
+    bottom: 80px;
+    left: 20px;
+    right: 20px;
+    max-height: 30vh;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    color: #c3e88d;
+    background: rgba(0, 8, 0, 0.8);
+    backdrop-filter: blur(8px);
+    border: 1px solid rgba(0, 255, 65, 0.15);
+    border-radius: 8px;
+    padding: 10px 14px;
+    z-index: 12;
+    scrollbar-width: thin;
+    scrollbar-color: #00ff41 transparent;
+    display: none;
+  }
+  #dudeLog::-webkit-scrollbar { width: 4px; }
+  #dudeLog::-webkit-scrollbar-thumb { background: #00ff41; border-radius: 2px; }
+  #dudeLog .log-entry { margin-bottom: 4px; }
+  #dudeLog .log-entry:last-child { opacity: 1; }
+  #dudeLog .log-input { color: #4fc3f7; }
+  #dudeLog .log-action { color: #ffb74d; font-style: italic; }
+  #dudeLog .log-result { color: #c3e88d; }
+
+  </style>
+</head>
+<body>
+
+<canvas id="rain-canvas"></canvas>
+<div id="face-layer">
+  <img id="face-idle" src="dude-idle.png" alt="The Dude">
+  <img id="face-talk" src="dude-idle.png" alt="The Dude">
+  <!-- talk image removed - single dude image -->
+</div>
+<canvas id="rain-overlay"></canvas>
+<div id="scanlines"></div>
+<div id="vignette"></div>
+<div id="boot-screen"><pre id="boot-text"></pre></div>
+
+<div id="chat-ui">
+  <div id="dude-text"></div>
+  <div id="status-indicator"></div>
+  <div id="input-row">
+    <input type="text" id="text-input" placeholder="Talk to The Dude..." autocomplete="off">
+    <button class="btn" id="send-btn" title="Send">
+      <svg viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2L15 22L11 13L2 9L22 2Z"/></svg>
+    </button>
+    <button class="btn" id="mic-btn" title="Tap to talk">
+      <svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+    </button>
+  </div>
+</div>
+
+<footer>
+  <a href="https://www.perplexity.ai/computer" target="_blank" rel="noopener noreferrer">
+    Created with Perplexity Computer
+  </a>
+</footer>
+
+<script>
+// ── CONFIG ──
+const API = "__PORT_8000__".startsWith("__") ? "" : "__PORT_8000__";
+const SILENCE_TIMEOUT_MS = 1800;
+const SILENCE_THRESHOLD = 0.015;
+const TEXT_FADE_DELAY = 4000;
+
+// ── DOM ──
+const bgCanvas = document.getElementById('rain-canvas');
+const bgCtx = bgCanvas.getContext('2d');
+const olCanvas = document.getElementById('rain-overlay');
+const olCtx = olCanvas.getContext('2d');
+const idleImg = document.getElementById('face-idle');
+const talkImg = document.getElementById('face-talk');
+
+const bootScreen = document.getElementById('boot-screen');
+const bootText = document.getElementById('boot-text');
+const textInput = document.getElementById('text-input');
+const sendBtn = document.getElementById('send-btn');
+const micBtn = document.getElementById('mic-btn');
+const statusEl = document.getElementById('status-indicator');
+const dudeTextEl = document.getElementById('dude-text');
+
+// ── STATE ──
+let isBusy = false;
+let audioCtx = null;
+let analyser = null;
+let volumeData = null;
+let isPlaying = false;
+let audioQueue = [];
+let playingAudio = false;
+let conversationMode = false;  // continuous listening mode
+let currentAudioEl = null;   // HTML5 Audio element for playback
+let currentSource = null;    // MediaElementSource for analyser
+let abortController = null;
+let textFadeTimer = null;
+
+// ── AUDIO CONTEXT ──
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256;
+    analyser.smoothingTimeConstant = 0.3; // Lower = more responsive to syllables
+    volumeData = new Uint8Array(analyser.frequencyBinCount);
+    analyser.connect(audioCtx.destination);
+  }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+}
+
+// ── STATUS ──
+function setStatus(text) {
+  if (text === 'thinking') {
+    statusEl.innerHTML = '<span class="thinking-dots"><span>.</span><span>.</span><span>.</span></span>';
+    statusEl.classList.add('visible');
+  } else {
+    statusEl.textContent = text || '';
+    statusEl.classList.toggle('visible', !!text);
+  }
+}
+
+// ── DUDE TEXT ──
+function showDudeText(text) {
+  if (textFadeTimer) clearTimeout(textFadeTimer);
+  dudeTextEl.textContent = text;
+  dudeTextEl.classList.add('visible');
+}
+function scheduleFadeDudeText() {
+  if (textFadeTimer) clearTimeout(textFadeTimer);
+  textFadeTimer = setTimeout(() => {
+    dudeTextEl.classList.remove('visible');
+  }, TEXT_FADE_DELAY);
+}
+function clearDudeText() {
+  if (textFadeTimer) clearTimeout(textFadeTimer);
+  dudeTextEl.textContent = '';
+  dudeTextEl.classList.remove('visible');
+}
+
+// ── INTERRUPT ──
+function interruptDude() {
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
+  stopAllAudio();
+  audioQueue = [];
+  playingAudio = false;
+  isPlaying = false;
+  mouthTarget = 0;
+  mouthOpenness = 0;
+  mouthVelocity = 0;
+  prevAmplitudes = [];
+  talkImg.style.opacity = '0';
+  talkImg.style.transform = '';
+  idleImg.style.opacity = '1';
+  clearDudeText();
+  setStatus('');
+  setBusy(false);
+}
+
+function stopAllAudio() {
+  if (currentAudioEl) {
+    currentAudioEl.pause();
+    currentAudioEl.src = '';
+    currentAudioEl = null;
+  }
+  if (currentSource) {
+    try { currentSource.disconnect(); } catch(e) {}
+    currentSource = null;
+  }
+}
+
+function setBusy(busy) {
+  isBusy = busy;
+  textInput.disabled = busy;
+  sendBtn.disabled = busy;
+}
+
+// ── STREAMING CHAT ──
+async function sendMessage(message) {
+  if (!message.trim()) return;
+  if (isBusy) {
+    interruptDude();
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  setBusy(true);
+  clearDudeText();
+  setStatus('thinking');
+  ensureAudioCtx();
+
+  abortController = new AbortController();
+  audioQueue = [];
+
+  try {
+    const res = await fetch(`${API}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: message.trim() }),
+      signal: abortController.signal,
+    });
+    await processSSEStream(res);
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.error('Chat error:', err);
+      setStatus('Connection lost, man...');
+      setTimeout(() => setStatus(''), 3000);
+      setBusy(false);
+    }
+  }
+}
+
+async function sendVoiceBlob(blob) {
+  if (isBusy) {
+    interruptDude();
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  setBusy(true);
+  clearDudeText();
+  setStatus('thinking');
+  ensureAudioCtx();
+
+  abortController = new AbortController();
+  audioQueue = [];
+
+  try {
+    const form = new FormData();
+    form.append('audio', blob, 'recording.webm');
+    const res = await fetch(`${API}/api/voice`, {
+      method: 'POST',
+      body: form,
+      signal: abortController.signal,
+    });
+
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      const data = await res.json();
+      setStatus(data.error || 'Something went wrong');
+      setTimeout(() => setStatus(''), 3000);
+      setBusy(false);
+      return;
+    }
+
+    await processSSEStream(res);
+  } catch (err) {
+    if (err.name !== 'AbortError') {
+      console.error('Voice error:', err);
+      setStatus('Connection lost, man...');
+      setTimeout(() => setStatus(''), 3000);
+      setBusy(false);
+    }
+  }
+}
+
+async function processSSEStream(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let fullText = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let event;
+        try { event = JSON.parse(line.slice(6)); } catch { continue; }
+
+        switch (event.type) {
+          case 'text':
+            fullText += event.chunk;
+            // Strip bash blocks from spoken text, show summary in log
+            let displayText = fullText.replace(/```[a-z]*\n[\s\S]*?```/g, '').replace(/\n{3,}/g, '\n\n').trim();
+            showDudeText(displayText || 'Working on it, man...');
+            break;
+          case 'log':
+            addLogEntry(event.kind, event.message);
+            if (fullText.length === event.chunk.length) setStatus('');
+            break;
+
+          case 'audio':
+            console.log('Audio event received:', event.data.length, 'chars');
+            audioQueue.push(event.data);
+            if (!playingAudio) drainAudioQueue();
+            break;
+
+          case 'transcription':
+            console.log('You said:', event.text);
+            break;
+
+          case 'done':
+            console.log('Stream done');
+            break;
+
+          case 'error':
+            setStatus(event.message || 'Something went wrong');
+            setTimeout(() => setStatus(''), 3000);
+            break;
+        }
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') throw err;
+  }
+
+  // If nothing to play, wrap up
+  if (audioQueue.length === 0 && !playingAudio) {
+    if (fullText) scheduleFadeDudeText();
+    setBusy(false);
+  }
+}
+
+// ── AUDIO PLAYBACK via HTML5 Audio + Web Audio analyser ──
+async function drainAudioQueue() {
+  if (playingAudio) return;
+  playingAudio = true;
+  ensureAudioCtx();
+
+  while (audioQueue.length > 0) {
+    const b64 = audioQueue.shift();
+    try {
+      await playAudioChunk(b64);
+    } catch (err) {
+      console.error('Playback error:', err);
+    }
+  }
+
+  playingAudio = false;
+  isPlaying = false;
+  stopTalking();
+  scheduleFadeDudeText();
+  setBusy(false);
+
+  // Continuous conversation: only auto-restart old-style recording if NOT on WebSocket
+  if (conversationMode && (!voiceWS || voiceWS.readyState !== WebSocket.OPEN)) {
+    setTimeout(() => {
+      if (!isRecording && !isBusy && !isPlaying) {
+        startRecording();
+      }
+    }, 600);
+  }
+}
+
+function playAudioChunk(b64mp3) {
+  return new Promise((resolve, reject) => {
+    try {
+      // Create blob URL from base64
+      const binary = atob(b64mp3);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: 'audio/mp3' });
+      const url = URL.createObjectURL(blob);
+
+      // Use HTML5 Audio element (more reliable cross-browser)
+      const audio = new Audio();
+      audio.crossOrigin = 'anonymous';
+
+      // Connect to Web Audio analyser for mouth sync
+      let source = null;
+      try {
+        source = audioCtx.createMediaElementSource(audio);
+        source.connect(analyser);
+        currentSource = source;
+      } catch (e) {
+        // If createMediaElementSource fails (e.g. CORS), play without analyser
+        console.warn('Could not connect audio to analyser:', e);
+      }
+
+      currentAudioEl = audio;
+      isPlaying = true;
+
+      audio.onended = () => {
+        URL.revokeObjectURL(url);
+        currentAudioEl = null;
+        if (source) {
+          try { source.disconnect(); } catch(e) {}
+        }
+        currentSource = null;
+        resolve();
+      };
+
+      audio.onerror = (e) => {
+        console.error('Audio element error:', e);
+        URL.revokeObjectURL(url);
+        currentAudioEl = null;
+        // Fallback: try Web Audio API decodeAudioData
+        playViaWebAudioAPI(bytes.buffer.slice(0)).then(resolve).catch(reject);
+      };
+
+      audio.src = url;
+      audio.play().catch(err => {
+        console.warn('Audio.play() rejected, trying Web Audio fallback:', err);
+        URL.revokeObjectURL(url);
+        currentAudioEl = null;
+        playViaWebAudioAPI(bytes.buffer.slice(0)).then(resolve).catch(reject);
+      });
+
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+// Fallback: decode and play via Web Audio API BufferSource
+function playViaWebAudioAPI(arrayBuffer) {
+  return new Promise((resolve, reject) => {
+    audioCtx.decodeAudioData(arrayBuffer).then(audioBuffer => {
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(analyser);
+      isPlaying = true;
+
+      source.onended = () => {
+        resolve();
+      };
+      source.start(0);
+    }).catch(err => {
+      console.error('Web Audio decode failed:', err);
+      reject(err);
+    });
+  });
+}
+
+// ── NATURAL MOUTH ANIMATION ──
+// Smooth physics-based mouth sync driven by audio amplitude
+// Uses crossfade between idle/talk images but with spring interpolation
+let mouthOpenness = 0;           // Current smoothed openness 0..1
+let mouthTarget = 0;             // Target openness from audio
+let mouthVelocity = 0;           // For spring physics
+let prevAmplitudes = [];         // Rolling history for envelope
+const MOUTH_OPEN_SPEED = 0.25;   // How fast mouth opens
+const MOUTH_CLOSE_SPEED = 0.10;  // How fast mouth closes (slower = more natural)
+const SPRING_DAMPING = 0.62;     // Spring damping factor
+const AMP_HISTORY = 5;           // Frames to average for envelope
+const NOISE_FLOOR = 10;          // Below this = silence
+const FULL_OPEN_LEVEL = 75;      // Amplitude for fully open mouth
+
+// Track time-domain for plosive detection
+let timeDomainData = null;
+
+function ensureTimeDomainBuffer() {
+  if (!timeDomainData && analyser) {
+    timeDomainData = new Uint8Array(analyser.fftSize);
+  }
+}
+
+function getAudioAmplitude() {
+  if (!analyser || !volumeData) return 0;
+  analyser.getByteFrequencyData(volumeData);
+  ensureTimeDomainBuffer();
+  
+  // Speech frequency energy (bins 2-40 for 256 FFT ~= 340Hz-6900Hz)
+  let speechSum = 0;
+  const speechStart = 2;
+  const speechEnd = Math.min(40, volumeData.length);
+  for (let i = speechStart; i < speechEnd; i++) {
+    speechSum += volumeData[i];
+  }
+  const speechAvg = speechSum / (speechEnd - speechStart);
+  
+  // Overall energy for consonants/plosives
+  let totalSum = 0;
+  for (let i = 0; i < volumeData.length; i++) totalSum += volumeData[i];
+  const totalAvg = totalSum / volumeData.length;
+  
+  // Time-domain peak for transient detection (plosives: p, b, t, d, k)
+  let peak = 0;
+  if (timeDomainData) {
+    analyser.getByteTimeDomainData(timeDomainData);
+    for (let i = 0; i < timeDomainData.length; i++) {
+      const v = Math.abs(timeDomainData[i] - 128);
+      if (v > peak) peak = v;
+    }
+  }
+  // Normalize peak to same scale as frequency data
+  const peakNorm = (peak / 128) * 100;
+  
+  // Blend: prioritize speech freqs, let plosives punch through
+  return Math.max(speechAvg, totalAvg * 0.7, peakNorm * 0.5);
+}
+
+function computeMouthTarget(amplitude) {
+  prevAmplitudes.push(amplitude);
+  if (prevAmplitudes.length > AMP_HISTORY) prevAmplitudes.shift();
+  
+  // Envelope: fast attack, slower release
+  const envMax = Math.max(...prevAmplitudes);
+  const envAvg = prevAmplitudes.reduce((a, b) => a + b, 0) / prevAmplitudes.length;
+  const envValue = envMax * 0.55 + envAvg * 0.45;
+  
+  if (envValue < NOISE_FLOOR) return 0;
+  
+  // Map to 0..1
+  let t = (envValue - NOISE_FLOOR) / (FULL_OPEN_LEVEL - NOISE_FLOOR);
+  t = Math.max(0, Math.min(1, t));
+  
+  // Smoothstep curve: snappy open, gradual close, natural intermediates
+  return t * t * (3 - 2 * t);
+}
+
+function updateMouthAnimation() {
+  if (isPlaying && analyser && volumeData) {
+    const amplitude = getAudioAmplitude();
+    mouthTarget = computeMouthTarget(amplitude);
+    
+    // Spring-damped interpolation (asymmetric: fast open, slow close)
+    const diff = mouthTarget - mouthOpenness;
+    const speed = diff > 0 ? MOUTH_OPEN_SPEED : MOUTH_CLOSE_SPEED;
+    mouthVelocity += diff * speed;
+    mouthVelocity *= SPRING_DAMPING;
+    mouthOpenness += mouthVelocity;
+    mouthOpenness = Math.max(0, Math.min(1, mouthOpenness));
+    
+    applyMouthVisuals(mouthOpenness);
+  } else if (!isPlaying) {
+    // Ease back to closed when not playing
+    if (mouthOpenness > 0.003) {
+      mouthVelocity += (0 - mouthOpenness) * MOUTH_CLOSE_SPEED;
+      mouthVelocity *= SPRING_DAMPING;
+      mouthOpenness += mouthVelocity;
+      mouthOpenness = Math.max(0, mouthOpenness);
+      applyMouthVisuals(mouthOpenness);
+    } else {
+      mouthOpenness = 0;
+      mouthVelocity = 0;
+      talkImg.style.opacity = '0';
+      idleImg.style.opacity = '1';
+    }
+  }
+  requestAnimationFrame(updateMouthAnimation);
+}
+
+function applyMouthVisuals(openness) {
+  // Heartbeat brightness pulse on idle image only - no talk image swap
+  talkImg.style.opacity = '0';
+  const brightness = 1 + openness * 0.6;  // pulse up to 1.6x brightness
+  const glow = openness * 40;  // green glow intensity
+  idleImg.style.filter = `brightness(${brightness}) drop-shadow(0 0 ${glow}px rgba(0,255,65,0.4))`;
+}
+
+function stopTalking() {
+  mouthTarget = 0;
+}
+
+// ── MIC + VAD ──
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+let micStream = null;
+let vadAnalyser = null;
+let vadData = null;
+let silenceStart = null;
+let vadInterval = null;
+
+async function startRecording() {
+  ensureAudioCtx();
+  if (isBusy || isPlaying) {
+    interruptDude();
+    await new Promise(r => setTimeout(r, 50));
+  }
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    const micSource = audioCtx.createMediaStreamSource(micStream);
+    vadAnalyser = audioCtx.createAnalyser();
+    vadAnalyser.fftSize = 512;
+    vadData = new Float32Array(vadAnalyser.fftSize);
+    micSource.connect(vadAnalyser);
+
+    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus' : 'audio/webm';
+    mediaRecorder = new MediaRecorder(micStream, { mimeType });
+    audioChunks = [];
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) audioChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = async () => {
+      cleanupMic();
+      if (audioChunks.length === 0) return;
+      const blob = new Blob(audioChunks, { type: 'audio/webm' });
+      if (blob.size > 500) {
+        await sendVoiceBlob(blob);
+      }
+    };
+
+    mediaRecorder.start(100);
+    isRecording = true;
+    silenceStart = null;
+    micBtn.classList.add('recording');
+    setStatus('Listening...');
+
+    vadInterval = setInterval(checkVAD, 100);
+  } catch (err) {
+    console.error('Mic error:', err);
+    setStatus('Mic access denied, man');
+    setTimeout(() => setStatus(''), 3000);
+  }
+}
+
+function checkVAD() {
+  if (!vadAnalyser || !isRecording) return;
+  vadAnalyser.getFloatTimeDomainData(vadData);
+  let rms = 0;
+  for (let i = 0; i < vadData.length; i++) rms += vadData[i] * vadData[i];
+  rms = Math.sqrt(rms / vadData.length);
+
+  if (rms < SILENCE_THRESHOLD) {
+    if (!silenceStart) silenceStart = Date.now();
+    else if (Date.now() - silenceStart > SILENCE_TIMEOUT_MS) {
+      stopRecording();
+    }
+  } else {
+    silenceStart = null;
+  }
+}
+
+function stopRecording() {
+  if (mediaRecorder && isRecording) {
+    isRecording = false;
+    micBtn.classList.remove('recording');
+    if (vadInterval) { clearInterval(vadInterval); vadInterval = null; }
+    try { mediaRecorder.stop(); } catch(e) {}
+  }
+}
+
+function cleanupMic() {
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+  }
+  if (vadInterval) { clearInterval(vadInterval); vadInterval = null; }
+  vadAnalyser = null;
+}
+
+// ── EVENTS ──
+sendBtn.addEventListener('click', () => {
+  const msg = textInput.value;
+  textInput.value = '';
+  sendMessage(msg);
+});
+
+textInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    const msg = textInput.value;
+    textInput.value = '';
+    sendMessage(msg);
+  }
+});
+
+textInput.addEventListener('input', () => {
+  if (isPlaying && textInput.value.length > 0) {
+    interruptDude();
+  }
+});
+
+micBtn.addEventListener('click', () => {
+  const isKiosk = new URLSearchParams(window.location.search).get('autolisten') === '1';
+  if (voiceWS && voiceWS.readyState === WebSocket.OPEN) {
+    // End WebSocket conversation
+    stopConversationWS();
+    if (!isKiosk) {
+      startWakeWordListener();
+      setStatus('Say "hey dude"...');
+    } else {
+      micBtn.classList.remove('recording');
+      setStatus('Tap mic to talk');
+    }
+  } else if (isKiosk) {
+    // Kiosk mode: go straight to WS voice
+    startConversationWS();
+    micBtn.classList.add('recording');
+    setStatus('Listening...');
+  } else if (wakeRecognition) {
+    stopWakeWordListener();
+    micBtn.classList.remove('recording');
+    setStatus('');
+  } else {
+    startWakeWordListener();
+    micBtn.classList.add('recording');
+    setStatus('Say "hey dude"...');
+  }
+});
+
+
+
+
+// ── WEBSOCKET VOICE (continuous conversation) ──
+let voiceWS = null;
+let wsMicStream = null;
+let wsAudioProcessor = null;
+let wsAudioCtx = null;
+
+function startConversationWS() {
+  if (voiceWS && voiceWS.readyState === WebSocket.OPEN) return;
+
+  ensureAudioCtx();
+  conversationMode = true;
+  micBtn.classList.add('recording');
+  setStatus('Connecting...');
+
+  // Build WebSocket URL (handle HTTPS → WSS)
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = proto + '//' + location.host + '/ws/voice';
+  voiceWS = new WebSocket(wsUrl);
+
+  voiceWS.onopen = async () => {
+    console.log('Voice WS connected');
+    setStatus('Listening...');
+
+    try {
+      wsMicStream = await navigator.mediaDevices.getUserMedia({ audio: {
+        sampleRate: 16000,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      }});
+
+      // Use ScriptProcessorNode to get raw PCM (AudioWorklet is better but more complex)
+      wsAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const source = wsAudioCtx.createMediaStreamSource(wsMicStream);
+      wsAudioProcessor = wsAudioCtx.createScriptProcessor(4096, 1, 1);
+
+      wsAudioProcessor.onaudioprocess = (e) => {
+        if (!voiceWS || voiceWS.readyState !== WebSocket.OPEN) return;
+        if (isPlaying) return;  // Don't send audio while Dude is talking
+
+        const float32 = e.inputBuffer.getChannelData(0);
+        // Convert Float32 [-1,1] to Int16
+        const int16 = new Int16Array(float32.length);
+        for (let i = 0; i < float32.length; i++) {
+          const s = Math.max(-1, Math.min(1, float32[i]));
+          int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        voiceWS.send(int16.buffer);
+      };
+
+      source.connect(wsAudioProcessor);
+      wsAudioProcessor.connect(wsAudioCtx.destination);
+
+    } catch (err) {
+      console.error('Mic error:', err);
+      setStatus('Mic access denied, man');
+      stopConversationWS();
+    }
+  };
+
+  voiceWS.onmessage = async (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+
+    switch (msg.type) {
+      case 'listening':
+        setStatus('Listening...');
+        micBtn.classList.add('recording');
+        setBusy(false);
+        break;
+
+      case 'processing':
+        setStatus('thinking');
+        setBusy(true);
+        break;
+
+      case 'transcription':
+        console.log('You said:', msg.text);
+        break;
+
+      case 'text':
+        if (!wsFullText) wsFullText = '';
+        wsFullText += msg.chunk;
+        showDudeText(wsFullText);
+        if (wsFullText.length === msg.chunk.length) setStatus('');
+        break;
+
+      case 'audio':
+        console.log('Audio received:', msg.data.length, 'chars');
+        audioQueue.push(msg.data);
+        if (!playingAudio) drainAudioQueue();
+        break;
+
+      case 'done':
+        console.log('Response done');
+        wsFullText = '';
+        // drainAudioQueue will handle setBusy(false) and re-listening
+        if (audioQueue.length === 0 && !playingAudio) {
+          scheduleFadeDudeText();
+          setBusy(false);
+        }
+        break;
+
+      case 'interrupted':
+        console.log('Interrupted');
+        stopAllAudio();
+        audioQueue = [];
+        break;
+
+      case 'error':
+        setStatus(msg.message || 'Something went wrong');
+        setTimeout(() => setStatus(''), 3000);
+        break;
+    }
+  };
+
+  voiceWS.onclose = () => {
+    console.log('Voice WS closed');
+    cleanupWS();
+  };
+
+  voiceWS.onerror = (err) => {
+    console.error('Voice WS error:', err);
+    cleanupWS();
+    setStatus('Connection lost');
+    setTimeout(() => setStatus(''), 3000);
+  };
+}
+
+let wsFullText = '';
+
+function stopConversationWS() {
+  conversationMode = false;
+  if (voiceWS && voiceWS.readyState === WebSocket.OPEN) {
+    try { voiceWS.send('stop'); } catch(e) {}
+    voiceWS.close();
+  }
+  cleanupWS();
+}
+
+function cleanupWS() {
+  micBtn.classList.remove('recording');
+  if (wsAudioProcessor) {
+    try { wsAudioProcessor.disconnect(); } catch(e) {}
+    wsAudioProcessor = null;
+  }
+  if (wsMicStream) {
+    wsMicStream.getTracks().forEach(t => t.stop());
+    wsMicStream = null;
+  }
+  if (wsAudioCtx && wsAudioCtx.state !== 'closed') {
+    try { wsAudioCtx.close(); } catch(e) {}
+    wsAudioCtx = null;
+  }
+  voiceWS = null;
+  conversationMode = false;
+  setStatus('');
+}
+
+// ── WAKE WORD ("dude") ──
+let wakeRecognition = null;
+function startWakeWordListener() {
+  if (!('webkitSpeechRecognition' in window)) {
+    console.warn('Wake word: Speech Recognition API not available');
+    return;
+  }
+  wakeRecognition = new webkitSpeechRecognition();
+  wakeRecognition.continuous = true;
+  wakeRecognition.interimResults = true;
+  wakeRecognition.lang = 'en-US';
+  wakeRecognition.maxAlternatives = 3;
+
+  wakeRecognition.onresult = (event) => {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      for (let j = 0; j < event.results[i].length; j++) {
+        const transcript = event.results[i][j].transcript.toLowerCase().trim();
+        if (transcript.includes('hey dude')) {
+          console.log('Wake word detected:', transcript);
+          conversationMode = true;
+          // Stop wake listener, start recording
+          stopWakeWordListener();
+          if (!isRecording && !isBusy && !isPlaying) {
+            startConversationWS();
+          }
+          return;
+        }
+      }
+    }
+  };
+
+  wakeRecognition.onend = () => {
+    // Restart if not recording (Chrome stops after ~60s)
+    if (!isRecording && !isBusy) {
+      setTimeout(() => startWakeWordListener(), 500);
+    }
+  };
+
+  wakeRecognition.onerror = (e) => {
+    if (e.error !== 'no-speech' && e.error !== 'aborted') {
+      console.warn('Wake word error:', e.error);
+    }
+  };
+
+  wakeRecognition.start();
+  console.log('Wake word listener active - say "dude" to start');
+}
+
+function stopWakeWordListener() {
+  if (wakeRecognition) {
+    try { wakeRecognition.abort(); } catch(e) {}
+    wakeRecognition = null;
+  }
+}
+
+// Re-arm wake word after Dude finishes responding
+// Wake word re-arms via mic button only
+
+// Start wake word on page load
+// Wake word starts when mic button is tapped
+
+// ── MATRIX RAIN ──
+function resizeCanvases() {
+  bgCanvas.width = olCanvas.width = window.innerWidth;
+  bgCanvas.height = olCanvas.height = window.innerHeight;
+}
+resizeCanvases();
+window.addEventListener('resize', resizeCanvases);
+
+const matrixChars = 'アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン日月木水火土金0123456789';
+const fontSize = 14;
+
+function createRainState(w) {
+  const cols = Math.floor(w / fontSize);
+  return {
+    drops: Array.from({length: cols}, () => Math.random() * -100),
+    speeds: Array.from({length: cols}, () => 0.15 + Math.random() * 0.75),
+    bright: Array.from({length: cols}, () => Math.random()),
+  };
+}
+let bgRain = createRainState(window.innerWidth);
+let olRain = createRainState(window.innerWidth);
+window.addEventListener('resize', () => {
+  resizeCanvases();
+  bgRain = createRainState(window.innerWidth);
+  olRain = createRainState(window.innerWidth);
+});
+
+function drawRainLayer(ctx, rain, fade) {
+  ctx.fillStyle = `rgba(0,0,0,${fade})`;
+  ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+  ctx.font = `${fontSize}px 'Courier New', monospace`;
+  for (let i = 0; i < rain.drops.length; i++) {
+    const char = matrixChars[Math.floor(Math.random() * matrixChars.length)];
+    const x = i * fontSize;
+    const y = rain.drops[i] * fontSize;
+    if (Math.random() > 0.97) {
+      ctx.fillStyle = '#aaffaa';
+      ctx.shadowColor = '#00ff41';
+      ctx.shadowBlur = 10;
+    } else {
+      const g = Math.floor(35 + rain.bright[i] * 120);
+      ctx.fillStyle = `rgb(0,${g},${Math.floor(g * 0.12)})`;
+      ctx.shadowBlur = 0;
+    }
+    ctx.fillText(char, x, y);
+    ctx.shadowBlur = 0;
+    if (y > ctx.canvas.height && Math.random() > 0.975) {
+      rain.drops[i] = 0;
+      rain.bright[i] = Math.random();
+    }
+    rain.drops[i] += rain.speeds[i];
+  }
+}
+
+// ── BREATHING GLOW ──
+let breathPhase = 0;
+function updateBreathing() {
+  breathPhase += 0.008;
+  const i = 0.82 + 0.18 * Math.sin(breathPhase);
+  const g1 = 22 + 18 * Math.sin(breathPhase);
+  const g2 = 45 + 30 * Math.sin(breathPhase * 0.7);
+  const f = `drop-shadow(0 0 ${g1}px rgba(0,255,65,${0.22*i})) drop-shadow(0 0 ${g2}px rgba(0,255,65,${0.08*i}))`;
+  idleImg.style.filter = f;
+  talkImg.style.filter = f;
+}
+
+// ── CRT ──
+function crtEffects() {
+  // Disabled - CRT flicker removed
+}
+
+// ── MAIN LOOP ──
+function mainLoop() {
+  drawRainLayer(bgCtx, bgRain, 0.045);
+  drawRainLayer(olCtx, olRain, 0.055);
+  updateBreathing();
+  requestAnimationFrame(mainLoop);
+}
+
+
+// ── WAKE LOCK (prevent screen dimming) ──
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      console.log('Wake lock acquired');
+      wakeLock.addEventListener('release', () => {
+        console.log('Wake lock released');
+      });
+    }
+  } catch (e) {
+    console.warn('Wake lock failed:', e);
+  }
+}
+// Re-acquire on visibility change (iOS releases on tab switch)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') requestWakeLock();
+});
+requestWakeLock();
+
+// ── BOOT ──
+function boot() {
+  const lines = [
+    '> INITIALIZING THE DUDE PROTOCOL...',
+    '> LOADING CONSCIOUSNESS MATRIX...',
+    '> CALIBRATING WHITE RUSSIAN SENSORS...',
+    '> FINDING RUG THAT TIES ROOM TOGETHER...',
+    '> CONNECTING TO COSMIC BOWLING ALLEY...',
+    '> THE DUDE ABIDES...',
+  ];
+  let shown = '';
+  let idx = 0;
+  (function next() {
+    if (idx < lines.length) {
+      shown += (shown ? '\n' : '') + lines[idx];
+      bootText.textContent = shown;
+      idx++;
+      setTimeout(next, 1200 + Math.random() * 600);
+    } else {
+      setTimeout(() => {
+        bootScreen.classList.add('hidden');
+        setTimeout(() => {
+          bootScreen.style.display = 'none';
+          textInput.focus();
+        }, 1000);
+      }, 2000);
+    }
+  })();
+}
+
+// ── START ──
+let loaded = 0;
+function onReady() {
+  loaded++;
+  if (loaded >= 2) {
+    mainLoop(); crtEffects(); updateMouthAnimation();
+    setTimeout(boot, 400);
+  }
+}
+idleImg.onload = onReady;
+talkImg.onload = onReady;
+if (idleImg.complete) loaded++;
+if (talkImg.complete) loaded++;
+if (loaded >= 2) { mainLoop(); crtEffects(); updateMouthAnimation(); setTimeout(boot, 400); }
+</script>
+<script src="dude-extras.js" defer>
+    // === Structured Log ===
+    const dudeLog = document.getElementById('dudeLog');
+
+    function addLogEntry(kind, message) {
+      if (!dudeLog) return;
+      dudeLog.style.display = 'block';
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      if (kind === 'input') {
+        entry.innerHTML = '<span class="log-input">&gt; ' + escapeHtml(message) + '</span>';
+      } else if (kind === 'action') {
+        entry.innerHTML = '<span class="log-action">' + escapeHtml(message) + '</span>';
+      } else if (kind === 'result') {
+        entry.innerHTML = '<span class="log-result">' + escapeHtml(message) + '</span>';
+      }
+      dudeLog.appendChild(entry);
+      dudeLog.scrollTop = dudeLog.scrollHeight;
+      // Auto-hide after 30s of no new entries
+      clearTimeout(dudeLog._hideTimer);
+      dudeLog._hideTimer = setTimeout(() => { dudeLog.style.display = 'none'; }, 30000);
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    function clearLog() {
+      if (dudeLog) { dudeLog.innerHTML = ''; dudeLog.style.display = 'none'; }
+    }
+
+  
+    
+    // Kiosk mode: show tap-to-talk prompt (no wake word on insecure origins)
+    if (new URLSearchParams(window.location.search).get('autolisten') === '1') {
+      setTimeout(() => {
+        setStatus('Tap mic to talk');
+      }, 3000);
+    }
+
+    // Auto-sync memory from rat on page load
+    fetch('/api/sync').then(r => r.json()).then(d => {
+      console.log('Memory sync:', d.status, d.message);
+    }).catch(() => {});
+</script>  <div id="dudeLog"></div>
+</body>
+</html>
