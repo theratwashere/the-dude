@@ -11,12 +11,13 @@ Architecture:
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import os
 import re
 import time
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +26,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from comet_bridge import CometBridge
+
+# MQTT bus — graceful degradation if broker not available
+try:
+    from mqtt_bus import DudeMQTT
+    HAS_MQTT = True
+except ImportError:
+    HAS_MQTT = False
+    logging.getLogger("the-dude").warning("MQTT module not found (pip install paho-mqtt)")
 
 # TTS engine — graceful degradation if no engine available
 try:
@@ -419,6 +428,47 @@ app.add_middleware(
 )
 
 
+# ── MQTT BUS ──
+_mqtt: Optional['DudeMQTT'] = None
+
+# ── FLEET MESSAGE BUS ──
+_messages: collections.deque = collections.deque(maxlen=20)  # recent message history
+_sse_queues: Set[asyncio.Queue] = set()  # one queue per connected SSE client
+
+
+def _mqtt_on_message(payload: dict):
+    """Callback: MQTT dude/message received → push to history + all SSE clients."""
+    entry = {
+        "text": payload.get("text", ""),
+        "source": payload.get("source", "unknown"),
+        "duration": payload.get("duration", 1.0),
+        "ts": payload.get("ts", int(time.time())),
+    }
+    _messages.append(entry)
+    log.info("Fleet message from %s: %s", entry["source"], entry["text"][:60])
+    # Push to all connected SSE clients
+    for q in list(_sse_queues):
+        try:
+            q.put_nowait(entry)
+        except asyncio.QueueFull:
+            pass
+
+
+@app.on_event("startup")
+async def startup_mqtt():
+    global _mqtt
+    if HAS_MQTT:
+        dude_name = os.environ.get("DUDE_NAME", "rat")
+        _mqtt = DudeMQTT(name=dude_name, on_message_received=_mqtt_on_message)
+        _mqtt.start()
+
+
+@app.on_event("shutdown")
+async def shutdown_mqtt():
+    if _mqtt:
+        _mqtt.stop()
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_LEN)
 
@@ -444,74 +494,64 @@ async def client_error(request: Request):
     return {"ok": True}
 
 
-# ── FLEET ──
-FLEET_DUDES = [
-    ("rat", "http://100.77.205.27:8000"),
-    # ("thor", "http://100.92.32.127:8000"),
-]
 
-# ── NOTIFICATION QUEUE ──
-_notify_queue: list = []
+# ── FLEET MESSAGE ENDPOINTS ──
 
-
-class NotifyRequest(BaseModel):
+class MessageRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=500)
-    duration: int = Field(default=5000, ge=500, le=60000)
-    color: str = Field(default="#00ff41")
-    size: int = Field(default=18)
-    position: str = Field(default="center")  # top, center, bottom
-    bg: bool = Field(default=True)
-    bg_opacity: float = Field(default=0.75)
     source: str = Field(default="")
+    duration: float = Field(default=1.0)  # minutes, or -1 for sticky (until next message)
 
 
-@app.post("/api/notify")
-async def notify(req: NotifyRequest):
-    """Queue a notification for the UI."""
-    _notify_queue.append(req.dict())
-    log.info(f"Notification queued: {req.text[:60]}")
-    return {"ok": True}
+@app.post("/api/message")
+async def post_message(req: MessageRequest):
+    """Broadcast a text message to all fleet Dudes via MQTT (and local SSE clients)."""
+    source = req.source or os.environ.get("DUDE_NAME", "rat")
+    if _mqtt and _mqtt.connected:
+        # Let MQTT echo back — _mqtt_on_message handles deque + SSE push
+        _mqtt.publish_message(req.text, source=source, duration=req.duration)
+        log.info("Fleet message (mqtt): %s", req.text[:60])
+        return {"ok": True, "via": "mqtt"}
+    # No MQTT — push locally only
+    entry = {"text": req.text, "source": source, "duration": req.duration, "ts": int(time.time())}
+    _messages.append(entry)
+    for q in list(_sse_queues):
+        try:
+            q.put_nowait(entry)
+        except asyncio.QueueFull:
+            pass
+    log.info("Fleet message (local only): %s", req.text[:60])
+    return {"ok": True, "via": "local"}
 
 
-@app.get("/api/notifications")
-async def get_notifications():
-    """Frontend polls this to pick up queued notifications."""
-    if not _notify_queue:
-        return {"notifications": []}
-    batch = list(_notify_queue)
-    _notify_queue.clear()
-    return {"notifications": batch}
+@app.get("/api/message-stream")
+async def message_stream(request: Request):
+    """SSE endpoint — pushes fleet messages to browser clients in real-time."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+    _sse_queues.add(queue)
 
+    async def event_generator():
+        try:
+            # Send recent history on connect so client isn't blank
+            for msg in list(_messages):
+                yield sse({"type": "message", **msg})
+            # Push new messages as they arrive
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield sse({"type": "message", **msg})
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"  # prevent connection timeout
+        finally:
+            _sse_queues.discard(queue)
 
-async def _notify_member(name: str, url: str, req: NotifyRequest):
-    """POST notification to a fleet member. Returns name on success."""
-    import aiohttp
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"{url}/api/notify",
-                json=req.dict(),
-                timeout=aiohttp.ClientTimeout(total=3),
-            ) as r:
-                if r.status == 200:
-                    log.info(f"Broadcast delivered to {name}")
-                    return name
-                log.warning(f"Broadcast to {name}: HTTP {r.status}")
-                return name
-    except Exception as e:
-        log.warning(f"Broadcast to {name} failed: {e}")
-        raise
-
-
-@app.post("/api/broadcast")
-async def broadcast(req: NotifyRequest):
-    """Send notification to ALL fleet Dude instances."""
-    tasks = [_notify_member(name, url, req) for name, url in FLEET_DUDES]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    delivered = sum(1 for r in results if not isinstance(r, Exception))
-    failed = sum(1 for r in results if isinstance(r, Exception))
-    log.info(f"Broadcast '{req.text[:40]}': {delivered} delivered, {failed} failed")
-    return {"ok": True, "delivered": delivered, "failed": failed}
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── SPOTIFY NOW PLAYING ──

@@ -1,0 +1,19 @@
+# The Dude — production dependencies
+# Install: pip3 install -r requirements.txt
+
+# Web server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Comet Bridge (CDP communication)
+aiohttp>=3.9.0
+websockets>=12.0
+
+# TTS (optional but recommended — high quality, free, no API key)
+edge-tts>=6.1.0
+
+# Data validation
+pydantic>=2.0.0
+
+# MQTT fleet notifications (requires mosquitto broker on rat)
+paho-mqtt>=2.0.0
