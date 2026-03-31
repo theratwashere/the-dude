@@ -2,16 +2,13 @@
 MQTT pub/sub bus for The Dude fleet.
 
 Connects to mosquitto broker on rat (Tailscale).
-Subscribes to dude/notify topics, pushes received messages
-into the local notification queue for the UI to pick up.
-
-Any machine on the tailnet can publish to dude/notify to
+Subscribes to dude/message for fleet-wide text messages.
+Any machine on the tailnet can publish to dude/message to
 broadcast a message to all Dude instances.
 """
 
 import json
 import logging
-import threading
 import time
 from typing import Callable, Optional
 
@@ -24,28 +21,27 @@ DEFAULT_BROKER = "100.77.205.27"
 DEFAULT_PORT = 1883
 
 # Topics
-TOPIC_NOTIFY_ALL = "dude/notify"          # broadcast to all Dudes
-TOPIC_PRESENCE = "dude/presence"          # online/offline (retained)
-TOPIC_SPOTIFY = "dude/spotify"            # now-playing updates
+TOPIC_MESSAGE = "dude/message"       # fleet-wide text messages
+TOPIC_PRESENCE = "dude/presence"     # online/offline (retained)
+TOPIC_SPOTIFY = "dude/spotify"       # now-playing updates
 
 
 class DudeMQTT:
-    """MQTT client for The Dude fleet notifications."""
+    """MQTT client for The Dude fleet."""
 
     def __init__(
         self,
         name: str = "rat",
         broker: str = DEFAULT_BROKER,
         port: int = DEFAULT_PORT,
-        on_notify: Optional[Callable] = None,
+        on_message_received: Optional[Callable] = None,
     ):
         self.name = name
         self.broker = broker
         self.port = port
-        self.on_notify = on_notify  # callback(dict) when notification received
+        self.on_message_received = on_message_received  # callback(dict) when message received
         self._client: Optional[mqtt.Client] = None
         self._connected = False
-        self._thread: Optional[threading.Thread] = None
 
     def start(self):
         """Connect to broker and start listening in background thread."""
@@ -76,7 +72,6 @@ class DudeMQTT:
     def stop(self):
         """Disconnect and stop background thread."""
         if self._client:
-            # Announce offline
             self._client.publish(
                 TOPIC_PRESENCE,
                 json.dumps({"name": self.name, "status": "offline"}),
@@ -88,15 +83,15 @@ class DudeMQTT:
             self._connected = False
             log.info("MQTT disconnected")
 
-    def broadcast(self, text: str, **opts):
-        """Publish a notification to all Dudes."""
-        payload = {"text": text, **opts}
-        self._publish(TOPIC_NOTIFY_ALL, payload, qos=1)
-
-    def notify_dude(self, target: str, text: str, **opts):
-        """Send notification to a specific Dude by name."""
-        payload = {"text": text, **opts}
-        self._publish(f"dude/notify/{target}", payload, qos=1)
+    def publish_message(self, text: str, source: Optional[str] = None, duration: float = 1.0):
+        """Broadcast a text message to all Dudes."""
+        payload = {
+            "text": text,
+            "source": source or self.name,
+            "duration": duration,
+            "ts": int(time.time()),
+        }
+        self._publish(TOPIC_MESSAGE, payload, qos=1)
 
     def publish_spotify(self, track_info: dict):
         """Publish now-playing info for all Dudes."""
@@ -124,11 +119,9 @@ class DudeMQTT:
             self._connected = True
             log.info("MQTT connected to broker")
 
-            # Subscribe to broadcast + our personal topic
-            client.subscribe(TOPIC_NOTIFY_ALL, qos=1)
-            client.subscribe(f"dude/notify/{self.name}", qos=1)
+            client.subscribe(TOPIC_MESSAGE, qos=1)
             client.subscribe(TOPIC_SPOTIFY, qos=0)
-            log.info("MQTT subscribed to dude/notify, dude/notify/%s, dude/spotify", self.name)
+            log.info("MQTT subscribed to %s, %s", TOPIC_MESSAGE, TOPIC_SPOTIFY)
 
             # Announce online (retained)
             client.publish(
@@ -155,8 +148,8 @@ class DudeMQTT:
         topic = msg.topic
         log.info("MQTT [%s]: %s", topic, str(payload)[:80])
 
-        if topic.startswith("dude/notify") and self.on_notify:
-            self.on_notify(payload)
+        if topic == TOPIC_MESSAGE and self.on_message_received:
+            self.on_message_received(payload)
 
 
 # ── Standalone test ──
@@ -166,21 +159,19 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     if len(sys.argv) > 1 and sys.argv[1] == "pub":
-        # Publish mode: mqtt_bus.py pub "message text"
-        text = " ".join(sys.argv[2:]) or "Test broadcast from CLI"
+        text = " ".join(sys.argv[2:]) or "Test message from CLI"
         bus = DudeMQTT(name="cli")
         bus.start()
-        time.sleep(1)  # wait for connect
-        bus.broadcast(text, source="cli", duration=8000)
+        time.sleep(1)
+        bus.publish_message(text, source="cli")
         print(f"Published: {text}")
         time.sleep(0.5)
         bus.stop()
     else:
-        # Subscribe mode: mqtt_bus.py
         def on_msg(payload):
             print(f"GOT: {payload}")
 
-        bus = DudeMQTT(name="test", on_notify=on_msg)
+        bus = DudeMQTT(name="test", on_message_received=on_msg)
         bus.start()
         print("Listening... (Ctrl+C to stop)")
         try:

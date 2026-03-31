@@ -11,12 +11,13 @@ Architecture:
 
 import asyncio
 import base64
+import collections
 import json
 import logging
 import os
 import re
 import time
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -430,26 +431,37 @@ app.add_middleware(
 # ── MQTT BUS ──
 _mqtt: Optional['DudeMQTT'] = None
 
-def _mqtt_on_notify(payload: dict):
-    """Callback: MQTT message received → push to notification system."""
-    global _notify_counter
-    _notify_counter += 1
-    entry = dict(payload)
-    entry["id"] = _notify_counter
-    entry["ts"] = time.time()
-    if "duration" not in entry:
-        entry["duration"] = 5000
-    _notifications.append(entry)
-    _prune_old_notifications()
-    log.info("MQTT notification #%d: %s", _notify_counter, str(payload.get("text", ""))[:60])
+# ── FLEET MESSAGE BUS ──
+_messages: collections.deque = collections.deque(maxlen=20)  # recent message history
+_sse_queues: Set[asyncio.Queue] = set()  # one queue per connected SSE client
+
+
+def _mqtt_on_message(payload: dict):
+    """Callback: MQTT dude/message received → push to history + all SSE clients."""
+    entry = {
+        "text": payload.get("text", ""),
+        "source": payload.get("source", "unknown"),
+        "duration": payload.get("duration", 1.0),
+        "ts": payload.get("ts", int(time.time())),
+    }
+    _messages.append(entry)
+    log.info("Fleet message from %s: %s", entry["source"], entry["text"][:60])
+    # Push to all connected SSE clients
+    for q in list(_sse_queues):
+        try:
+            q.put_nowait(entry)
+        except asyncio.QueueFull:
+            pass
+
 
 @app.on_event("startup")
 async def startup_mqtt():
     global _mqtt
     if HAS_MQTT:
         dude_name = os.environ.get("DUDE_NAME", "rat")
-        _mqtt = DudeMQTT(name=dude_name, on_notify=_mqtt_on_notify)
+        _mqtt = DudeMQTT(name=dude_name, on_message_received=_mqtt_on_message)
         _mqtt.start()
+
 
 @app.on_event("shutdown")
 async def shutdown_mqtt():
@@ -482,69 +494,63 @@ async def client_error(request: Request):
     return {"ok": True}
 
 
-# ── NOTIFICATION SYSTEM (per-client queues) ──
-# Notifications are stored with an incrementing ID.
-# Each client tracks its last-seen ID via query param.
-# Notifications expire after 60s to prevent unbounded growth.
+# ── FLEET MESSAGE ENDPOINTS ──
 
-_notifications: list = []  # [{id, ts, ...notification data}]
-_notify_counter = 0
-NOTIFY_TTL = 600  # 10 minutes — keep notifications available for slow pollers and refreshes
-
-
-class NotifyRequest(BaseModel):
+class MessageRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=500)
-    duration: int = Field(default=5000, ge=500, le=60000)
-    color: str = Field(default="#00ff41")
-    size: int = Field(default=18)
-    position: str = Field(default="center")  # top, center, bottom
-    bg: bool = Field(default=False)
-    bg_opacity: float = Field(default=0.75)
     source: str = Field(default="")
+    duration: float = Field(default=1.0)  # minutes, or -1 for sticky (until next message)
 
 
-def _prune_old_notifications():
-    """Remove notifications older than TTL."""
-    cutoff = time.time() - NOTIFY_TTL
-    while _notifications and _notifications[0]["ts"] < cutoff:
-        _notifications.pop(0)
-
-
-@app.post("/api/notify")
-async def notify(req: NotifyRequest):
-    """Queue a notification for all clients."""
-    global _notify_counter
-    _notify_counter += 1
-    entry = req.dict()
-    entry["id"] = _notify_counter
-    entry["ts"] = time.time()
-    _notifications.append(entry)
-    _prune_old_notifications()
-    log.info(f"Notification #{_notify_counter}: {req.text[:60]}")
-    return {"ok": True, "id": _notify_counter}
-
-
-@app.get("/api/notifications")
-async def get_notifications(since: int = 0):
-    """Get notifications newer than `since` ID. Each client tracks its own cursor."""
-    _prune_old_notifications()
-    new = [n for n in _notifications if n["id"] > since]
-    last_id = _notifications[-1]["id"] if _notifications else since
-    return {"notifications": new, "last_id": last_id}
-
-
-@app.post("/api/broadcast")
-async def broadcast(req: NotifyRequest):
-    """Broadcast notification to ALL fleet Dude instances via MQTT."""
+@app.post("/api/message")
+async def post_message(req: MessageRequest):
+    """Broadcast a text message to all fleet Dudes via MQTT (and local SSE clients)."""
+    source = req.source or os.environ.get("DUDE_NAME", "rat")
     if _mqtt and _mqtt.connected:
-        _mqtt.broadcast(req.text, **{k: v for k, v in req.dict().items() if k != "text"})
-        log.info(f"MQTT broadcast: {req.text[:60]}")
+        # Let MQTT echo back — _mqtt_on_message handles deque + SSE push
+        _mqtt.publish_message(req.text, source=source, duration=req.duration)
+        log.info("Fleet message (mqtt): %s", req.text[:60])
         return {"ok": True, "via": "mqtt"}
-    else:
-        # Fallback: just local queue
-        _notify_queue.append(req.dict())
-        log.warning("MQTT not connected, broadcast went to local queue only")
-        return {"ok": True, "via": "local"}
+    # No MQTT — push locally only
+    entry = {"text": req.text, "source": source, "duration": req.duration, "ts": int(time.time())}
+    _messages.append(entry)
+    for q in list(_sse_queues):
+        try:
+            q.put_nowait(entry)
+        except asyncio.QueueFull:
+            pass
+    log.info("Fleet message (local only): %s", req.text[:60])
+    return {"ok": True, "via": "local"}
+
+
+@app.get("/api/message-stream")
+async def message_stream(request: Request):
+    """SSE endpoint — pushes fleet messages to browser clients in real-time."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=50)
+    _sse_queues.add(queue)
+
+    async def event_generator():
+        try:
+            # Send recent history on connect so client isn't blank
+            for msg in list(_messages):
+                yield sse({"type": "message", **msg})
+            # Push new messages as they arrive
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield sse({"type": "message", **msg})
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"  # prevent connection timeout
+        finally:
+            _sse_queues.discard(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── SPOTIFY NOW PLAYING ──

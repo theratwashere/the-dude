@@ -53,19 +53,20 @@ window.addEventListener('unhandledrejection', function(e) {
     position: fixed; top: 0; left: 0;
     width: 100%; height: 100%;
     display: flex; align-items: center; justify-content: center;
-    z-index: 1;
+    z-index: 3;  /* above rain-overlay (z=2) so rain is behind the Dude */
   }
   #face-layer img {
     height: 100vh; width: 100vw;
     object-fit: contain;
+    opacity: 0.6;  /* let rain bleed through — Car Thing style */
     filter: drop-shadow(0 0 30px rgba(0,255,65,0.25)) drop-shadow(0 0 60px rgba(0,255,65,0.1));
   }
   @media (max-width: 768px) {
     #face-layer img {
-      height: 60vh; width: auto;
+      height: 80vh; width: auto;
     }
   }
-  #face-idle { opacity: 1; position: absolute; }
+  #face-idle { opacity: inherit; position: absolute; }
   #face-talk { opacity: 0; position: absolute; pointer-events: none; will-change: opacity, transform; }
   #face-canvas {
     position: absolute;
@@ -118,7 +119,7 @@ window.addEventListener('unhandledrejection', function(e) {
   #song-canvas {
     position: fixed; top: 0; left: 0;
     width: 100%; height: 100%;
-    z-index: 6; pointer-events: none;
+    z-index: 15; pointer-events: none;
   }
   #scanlines {
     position: fixed; top: 0; left: 0;
@@ -334,8 +335,8 @@ window.addEventListener('unhandledrejection', function(e) {
 
 <canvas id="rain-canvas"></canvas>
 <div id="face-layer">
-  <img id="face-idle" src="dude-idle.webp" alt="The Dude">
-  <img id="face-talk" src="dude-talk.webp" alt="The Dude talking">
+  <img id="face-idle" src="dude-transparent.png" alt="The Dude">
+  <img id="face-talk" src="dude-transparent.png" alt="The Dude talking">
   <canvas id="face-canvas"></canvas>
 </div>
 <div id="mouth-overlay">
@@ -2119,62 +2120,47 @@ function updateBreathing() {
 let crtGlitchX = 0;
 function crtEffects() { }
 
-// ── NOTIFICATIONS (Car Thing-style centered overlay) ──
-let _notifyQueue = [];  // pending notifications
-let _activeNotify = null; // {text, duration, color, size, position, bg, bg_opacity, startedAt}
+// ── FLEET MESSAGE DISPLAY ──
+let _fleetMsg = null;  // {text, source, startedAt, duration}
 let _lastTrackId = '';
 
-function showNotify(opts) {
-  _notifyQueue.push({
-    text: opts.text || '',
-    duration: opts.duration || 5000,
-    color: opts.color || '#00ff41',
-    size: opts.size || (isMobile ? 14 : 18),
-    position: opts.position || 'bottom',
-    bg: opts.bg === true,  // off by default, opt-in
-    bg_opacity: opts.bg_opacity || 0.75,
-    source: opts.source || '',
-  });
+function showFleetMessage(text, source, durationMinutes) {
+  // durationMinutes: -1 = sticky (show until next message), otherwise minutes
+  const ms = durationMinutes === -1 ? -1 : (durationMinutes || 1) * 60 * 1000;
+  _fleetMsg = {
+    text: text || '',
+    source: source || '',
+    duration: ms,  // -1 = sticky
+    startedAt: performance.now(),
+  };
 }
 
-function drawNotify() {
+function drawFleetMessage() {
   const ctx = songCtx;
   const W = songCanvas.width;
   const H = songCanvas.height;
   ctx.clearRect(0, 0, W, H);
 
-  // Promote next in queue if nothing active
-  if (!_activeNotify && _notifyQueue.length > 0) {
-    _activeNotify = _notifyQueue.shift();
-    _activeNotify.startedAt = performance.now();
-  }
-  if (!_activeNotify) return;
+  if (!_fleetMsg) return;
 
-  const n = _activeNotify;
+  const n = _fleetMsg;
   const elapsed = performance.now() - n.startedAt;
   const fadeInMs = 300;
   const fadeOutMs = 1000;
-  const totalMs = n.duration + fadeOutMs;
+  const sticky = n.duration === -1;
 
-  // Done — clear and let next one in
-  if (elapsed > totalMs) {
-    _activeNotify = null;
-    return;
+  if (!sticky) {
+    const totalMs = n.duration + fadeOutMs;
+    if (elapsed > totalMs) { _fleetMsg = null; return; }
   }
 
-  // Opacity: fade in, hold, fade out
   const fadeIn = Math.min(1, elapsed / fadeInMs);
-  const fadeOut = Math.max(0, 1 - Math.max(0, elapsed - n.duration) / fadeOutMs);
+  const fadeOut = sticky ? 1 : Math.max(0, 1 - Math.max(0, elapsed - n.duration) / fadeOutMs);
   const opacity = fadeIn * fadeOut;
 
-  // Position
-  let yCenter;
-  if (n.position === 'top') yCenter = H * 0.15;
-  else if (n.position === 'bottom') yCenter = H * 0.82;
-  else yCenter = H * 0.45;
-
+  const size = isMobile ? 14 : 18;
   ctx.save();
-  ctx.font = `bold ${n.size}px 'Courier New', monospace`;
+  ctx.font = `${size}px 'Courier New', monospace`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
 
@@ -2188,45 +2174,25 @@ function drawNotify() {
     else lines[lines.length - 1] = test;
   }
 
-  const lineH = n.size * 1.4;
-  const blockH = lines.length * lineH;
-  const startY = yCenter - blockH / 2 + lineH / 2;
+  const lineH = size * 1.4;
+  const startY = H * 0.72 - (lines.length * lineH) / 2 + lineH / 2;
 
-  // Background bar
-  if (n.bg) {
-    const bgW = Math.min(maxWidth + 40, W * 0.9);
-    ctx.globalAlpha = opacity * n.bg_opacity;
-    ctx.fillStyle = '#000';
-    ctx.fillRect((W - bgW) / 2, yCenter - blockH / 2 - 12, bgW, blockH + 24);
-  }
-
-  // Text with dark outline for visibility against green face
-  ctx.globalAlpha = opacity;
-  ctx.strokeStyle = '#000';
-  ctx.lineWidth = 4;
-  ctx.lineJoin = 'round';
-  ctx.fillStyle = n.color;
-  ctx.shadowColor = '#000';
-  ctx.shadowBlur = 8;
+  ctx.globalAlpha = opacity * 0.55;
+  ctx.fillStyle = '#00ff41';
   lines.forEach((line, i) => {
-    const y = startY + i * lineH;
-    ctx.strokeText(line, W / 2, y);
-    ctx.fillText(line, W / 2, y);
+    ctx.fillText(line, W / 2, startY + i * lineH);
   });
-  ctx.shadowBlur = 0;
 
-  // Source tag (small, dimmer, below text)
   if (n.source) {
     ctx.globalAlpha = opacity * 0.4;
-    ctx.font = `${Math.floor(n.size * 0.6)}px 'Courier New', monospace`;
+    ctx.font = `${Math.floor(size * 0.6)}px 'Courier New', monospace`;
     ctx.fillText('— ' + n.source, W / 2, startY + lines.length * lineH + 8);
   }
-
   ctx.restore();
 }
 
 function startNowPlayingPoll() {
-  // Spotify track changes
+  // Spotify track changes — still polled (Spotify has no push API)
   setInterval(async () => {
     try {
       const r = await fetch(`${API}/api/now-playing`);
@@ -2235,21 +2201,24 @@ function startNowPlayingPoll() {
       const tid = d.track + '|' + d.artist;
       if (tid !== _lastTrackId) {
         _lastTrackId = tid;
-        showNotify({ text: d.track + '  \u00b7  ' + d.artist, position: 'bottom', duration: 4000, size: isMobile ? 12 : 16 });
+        showFleetMessage(d.track + '  \u00b7  ' + d.artist, '', 0.067);  // ~4 seconds
       }
     } catch(e) {}
   }, 5000);
+}
 
-  // General notifications (per-client cursor via since= param)
-  let _lastNotifyId = 0;
-  setInterval(async () => {
+function startMessageStream() {
+  // SSE — server pushes fleet messages, no polling needed
+  const es = new EventSource(`${API}/api/message-stream`);
+  es.onmessage = (e) => {
     try {
-      const r = await fetch(`${API}/api/notifications?since=${_lastNotifyId}`);
-      const d = await r.json();
-      if (d.last_id) _lastNotifyId = d.last_id;
-      for (const n of (d.notifications || [])) showNotify(n);
-    } catch(e) {}
-  }, 2000);
+      const d = JSON.parse(e.data);
+      if (d.text) showFleetMessage(d.text, d.source || '', d.duration ?? 1);
+    } catch(_) {}
+  };
+  es.onerror = () => {
+    // Browser auto-reconnects on error — nothing to do
+  };
 }
 
 // ── MAIN LOOP ──
@@ -2264,7 +2233,7 @@ function mainLoop(ts) {
   } else {
     if (bgRain) drawRainLayer(bgCtx, bgRain, 0.045);
     if (olRain) drawRainLayer(olCtx, olRain, 0.055);
-    drawNotify();
+    drawFleetMessage();
     updateBreathing();
   }
   requestAnimationFrame(mainLoop);
@@ -2310,8 +2279,8 @@ function tryStart() {
   resizeCanvases(); // ensure song canvas is sized after DOM is ready
   mainLoop(); crtEffects(); updateMouthAnimation();
   setTimeout(boot, 400);
-  // Delay notification polling until boot screen finishes (~6s)
   setTimeout(startNowPlayingPoll, 7000);
+  setTimeout(startMessageStream, 2000);  // SSE connects early
 }
 function onReady() {
   loaded++;
