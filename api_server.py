@@ -436,8 +436,25 @@ _messages: collections.deque = collections.deque(maxlen=20)  # recent message hi
 _sse_queues: Set[asyncio.Queue] = set()  # one queue per connected SSE client
 
 
+IMESSAGE_FORWARD_TO = "+14125196169"
+
+
+def _send_imessage(recipient: str, text: str):
+    """Fire-and-forget iMessage via osascript."""
+    import subprocess
+    script = (
+        f'tell application "Messages"\n'
+        f'  send "{text}" to participant "{recipient}"\n'
+        f'end tell'
+    )
+    try:
+        subprocess.Popen(["osascript", "-e", script])
+    except Exception as e:
+        log.warning("iMessage send failed: %s", e)
+
+
 def _mqtt_on_message(payload: dict):
-    """Callback: MQTT dude/message received → push to history + all SSE clients."""
+    """Callback: MQTT dude/message received → push to history + SSE clients + iMessage."""
     entry = {
         "text": payload.get("text", ""),
         "source": payload.get("source", "unknown"),
@@ -452,6 +469,9 @@ def _mqtt_on_message(payload: dict):
             q.put_nowait(entry)
         except asyncio.QueueFull:
             pass
+    # Forward to iMessage
+    imsg = f"[{entry['source']}] {entry['text']}"
+    _send_imessage(IMESSAGE_FORWARD_TO, imsg)
 
 
 @app.on_event("startup")
